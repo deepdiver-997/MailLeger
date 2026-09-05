@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mailagent"
+version = "0.1.0"
+description = "AI 邮件助手：IMAP 扫描 + 规则/大模型分类 + 重要邮件即时通知 + 每日汇总（含崩溃恢复与成本控制）"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyYAML>=6.0",
+    "requests>=2.28",
+]
+
+[project.scripts]
+mailagent = "src.cli:main"
+
+[tool.setuptools]
+packages = ["src"]

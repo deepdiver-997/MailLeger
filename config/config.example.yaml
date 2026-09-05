@@ -1,0 +1,65 @@
+# =====================================================================
+# MailAgent 示例配置（可提交/公开）
+# 本地真实配置 config/config.yaml（含个人账号）已被 .gitignore 忽略。
+# 用法：cp config/config.example.yaml config/config.yaml，再把敏感项改成
+#       ${ENV_VAR} 引用（配合 .env 文件：IMAP_PASSWORD / SMTP_PASSWORD / OPENAI_API_KEY）。
+# =====================================================================
+
+database_path: data/mailagent.db
+log_file: logs/mailagent.log
+log_level: INFO
+
+# watch 模式的轮询间隔（秒）
+scan_interval_seconds: 300
+
+# 正文超过该字符数则不调用大模型，直接发送"请人工查看"模板通知
+max_body_chars: 2000
+# 提取正文时的硬上限字符数（防止超大邮件占用内存）
+max_extract_chars: 20000
+# 通知邮件中"判断原因"字段最大长度（字符）
+reason_max_chars: 100
+# outbox 单封邮件最大发送重试次数
+max_send_retries: 50
+# 每日汇总调用大模型生成摘要的输入上限（字符），超过则只输出分组列表
+summary_llm_max_chars: 4000
+
+# 大模型（OpenAI 兼容 API，如 DeepSeek / OpenAI）
+llm:
+  base_url: https://api.openai.com/v1
+  api_key: ${OPENAI_API_KEY}
+  model_name: gpt-4o-mini
+  max_tokens: 100
+  timeout_seconds: 30
+  max_retries: 2
+  # API 支持 JSON 模式时开启；不支持会自动降级为纯提示词约束
+  json_mode: true
+
+accounts:
+  - name: main
+    imap_host: imap.example.com
+    imap_port: 993
+    imap_use_ssl: true
+    imap_user: you@example.com
+    imap_password: ${IMAP_PASSWORD}
+
+    smtp_host: smtp.example.com
+    smtp_port: 465
+    smtp_use_ssl: true        # false 时配合 smtp_starttls 使用 STARTTLS
+    smtp_starttls: false
+    smtp_user: you@example.com
+    smtp_password: ${SMTP_PASSWORD}
+
+    # 重要邮件通知收件箱
+    notification_to: you@internal.example.com
+    notification_from: mailagent@internal.example.com
+
+    # 每日汇总时间（本地时间 HH:MM）
+    daily_summary_time: "21:00"
+
+    # 每账号每日大模型配额
+    daily_max_calls: 500
+    daily_max_tokens: 1000000
+
+    # 处理完成后对服务器邮件的动作：mark_seen 或 move（移动到 processed_folder）
+    on_processed: mark_seen
+    processed_folder: Processed
