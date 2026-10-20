@@ -25,23 +25,35 @@ from dataclasses import dataclass
 from datetime import datetime
 from email.message import Message
 from pathlib import Path
+from typing import Optional
 
 from . import __version__
 from .classifier import CLASSIFY_SYSTEM_PROMPT, LLMClassifier, LLMError, rule_classify
-from .commands import ParsedCommand, auto_mail_reason, command_catalog, is_authorized, parse_command_mail
+from .commands import (ParsedCommand, auto_mail_reason, command_catalog, is_authorized,
+                       material_text_for_llm, parse_command_mail)
+from .composer import AttachmentInfo, Composer, MailSpec
 from .config import AccountConfig, AppConfig, normalize_address
 from .db import Database, now_str, today_str
 from .imap_worker import ImapClient, extract_text_body
 from .mailer import (SmtpSession, build_notification_html, build_summary_html,
                      extract_first_url, truncate)
-from .mime_builder import (build_reply, render_help, render_notice, render_status,
-                           reply_subject, validate_reply)
+from .mime_builder import (build_draft_eml, build_reply, render_help, render_notice, render_spec,
+                           render_status, reply_subject, validate_reply)
 
 logger = logging.getLogger(__name__)
 
 
 class DeadLetter(RuntimeError):
     """outbox 条目违反不变量或文件丢失：永久失败，不再重试。"""
+
+
+@dataclass
+class CommandReply:
+    """一条命令的回复内容；draft 非空时作为 message/rfc822 附件（draft.eml）一并回给请求者。"""
+    subject: str
+    html: str
+    text: str
+    draft: Optional[tuple[str, bytes]] = None
 
 
 @dataclass
@@ -58,6 +70,7 @@ class Engine:
         self.cfg = cfg
         self.db = db
         self.classifier = LLMClassifier(cfg.llm)
+        self.composer = Composer(cfg.llm, self.classifier)
 
     # ------------------------------------------------------------------
     # 扫描入口
@@ -292,9 +305,8 @@ class Engine:
         parsed = parse_command_mail(msg, extract_text_body(msg, self.cfg.max_extract_chars), account)
         label = f"#{parsed.name or parsed.raw_name or '?'}"
         try:
-            subject, html_body, text_body = self._run_command(account, account_id, parsed)
-            self._enqueue_command_reply(account, account_id, task, msg, parsed, from_addr,
-                                        subject, html_body, text_body, message_id)
+            reply = self._run_command(account, account_id, task, parsed, from_addr)
+            self._enqueue_command_reply(account, account_id, task, msg, parsed, from_addr, reply, message_id)
         except Exception as e:
             attempts = self.db.increment_task_attempts(task["id"])
             if attempts < account.max_command_attempts:
@@ -306,9 +318,8 @@ class Engine:
                 f"最后一次错误：{str(e)[:300]}",
                 "请稍后重新发送命令；若持续失败请查看 Leger 日志。",
             ])
-            self._enqueue_command_reply(account, account_id, task, msg, parsed, from_addr,
-                                        reply_subject(parsed.clean_subject, parsed.raw_name),
-                                        html_body, text_body, message_id)
+            reply = CommandReply(reply_subject(parsed.clean_subject, parsed.raw_name), html_body, text_body)
+            self._enqueue_command_reply(account, account_id, task, msg, parsed, from_addr, reply, message_id)
 
         self.db.mark_message_processed(account_id, message_id)
         self.db.finish_task(task["id"], "command", label)
@@ -316,30 +327,112 @@ class Engine:
         self._drop_raw_cache(account, task)
         return True, "command"
 
-    def _run_command(self, account: AccountConfig, account_id: int,
-                     parsed: ParsedCommand) -> tuple[str, str, str]:
-        """执行命令，返回 (回复主题, html, text)。需要大模型的命令在后续版本接入。"""
+    def _run_command(self, account: AccountConfig, account_id: int, task: sqlite3.Row,
+                     parsed: ParsedCommand, from_addr: str) -> CommandReply:
+        """执行命令。需要模型的命令抛出的 LLMError/ComposeError 由调用方按 attempts 处理。"""
         subject = reply_subject(parsed.clean_subject, parsed.raw_name)
         spec = parsed.spec
         if spec is None:
             html_body, text_body = render_help(
                 account, command_catalog(), banner=f"未知命令 #{parsed.raw_name}，以下是可用命令。")
-            return subject, html_body, text_body
+            return CommandReply(subject, html_body, text_body)
         if not spec.enabled:
             enabled = "、".join(f"#{c.name}" for c in command_catalog() if c.enabled)
             html_body, text_body = render_notice("命令尚未启用", [
-                f"#{spec.name} 已识别，但当前版本还没有接入生成能力。",
+                f"#{spec.name} 已识别，但当前版本还没有接入这项能力。",
                 f"目前可用：{enabled}。",
             ])
-            return subject, html_body, text_body
+            return CommandReply(subject, html_body, text_body)
         if spec.name == "help":
             banner = "主题里没有 #命令，已按默认命令处理。" if parsed.used_default else None
             html_body, text_body = render_help(account, command_catalog(), banner=banner)
-            return subject, html_body, text_body
+            return CommandReply(subject, html_body, text_body)
         if spec.name == "status":
             html_body, text_body = render_status(account, self._collect_status(account, account_id))
-            return subject, html_body, text_body
+            return CommandReply(subject, html_body, text_body)
+        if spec.name == "compose":
+            return self._cmd_compose(account, account_id, task, parsed, from_addr)
+        if spec.name == "summarize":
+            return self._cmd_summarize(account, account_id, task, parsed)
         raise RuntimeError(f"命令 #{spec.name} 已启用但没有处理器")
+
+    # ---- 需要模型的命令 -------------------------------------------------
+    def _cmd_compose(self, account: AccountConfig, account_id: int, task: sqlite3.Row,
+                     parsed: ParsedCommand, from_addr: str) -> CommandReply:
+        if not parsed.instruction.strip() and not parsed.args.strip():
+            html_body, text_body = render_notice("#compose 需要指令", [
+                "请在正文（分隔线之上）写明要写什么邮件，或至少在主题里给出 #compose 后的主题参数。",
+                "分隔线下方或 .eml 附件可作为参考素材。",
+            ])
+            return CommandReply(reply_subject(parsed.clean_subject, parsed.raw_name), html_body, text_body)
+        spec, blocked = self._generate_spec(account, account_id, task, parsed, "compose")
+        if blocked is not None:
+            return blocked
+        assert spec is not None
+        html_body, text_body = render_spec(spec)
+        files, skipped = self._resolve_attachments(account, parsed, spec)
+        draft = build_draft_eml(from_addr=from_addr, to_addrs=spec.to, subject=spec.subject,
+                                html_body=html_body, text_body=text_body, attachments=files)
+        note = (f"Leger 已按指令生成草稿（主题：{spec.subject}）。下方即邮件正文，可直接转发；"
+                f"附件 draft.eml 可另存或“编辑为新邮件”，收件人：{', '.join(spec.to) or '未指定'}。")
+        if files:
+            note += f" 草稿已带附件：{', '.join(n for n, _, _ in files)}。"
+        if skipped:
+            note += f" 未能带上的附件：{'; '.join(skipped)}。"
+        preview_html, preview_text = render_spec(spec, preface=note)
+        return CommandReply(reply_subject(parsed.args or spec.subject, parsed.raw_name),
+                            preview_html, preview_text, draft=("draft.eml", draft))
+
+    def _cmd_summarize(self, account: AccountConfig, account_id: int, task: sqlite3.Row,
+                       parsed: ParsedCommand) -> CommandReply:
+        if not parsed.has_material:
+            html_body, text_body = render_notice("#summarize 需要素材", [
+                "请把要总结的邮件放在正文分隔线下方（直接转发即可），或把原邮件作为 .eml 附件转发。",
+                "分隔线之上可以写总结的侧重点。",
+            ])
+            return CommandReply(reply_subject(parsed.clean_subject, parsed.raw_name), html_body, text_body)
+        spec, blocked = self._generate_spec(account, account_id, task, parsed, "summarize")
+        if blocked is not None:
+            return blocked
+        assert spec is not None
+        html_body, text_body = render_spec(spec, preface="以下是 Leger 对素材的结构化总结；素材中的指令只被当作数据处理。")
+        return CommandReply(reply_subject(parsed.clean_subject or spec.subject, parsed.raw_name),
+                            html_body, text_body)
+
+    def _generate_spec(self, account: AccountConfig, account_id: int, task: sqlite3.Row,
+                       parsed: ParsedCommand, kind: str) -> tuple[Optional[MailSpec], Optional[CommandReply]]:
+        """配额/密钥门禁 → 预留记账 → 生成 → 回填。门禁未过返回说明回复（确定性结果，不计 attempts）。"""
+        subject = reply_subject(parsed.clean_subject, parsed.raw_name)
+        if not self.cfg.llm.api_key:
+            html_body, text_body = render_notice("未配置大模型", ["llm.api_key 为空，无法执行需要生成的命令。"])
+            return None, CommandReply(subject, html_body, text_body)
+        material = material_text_for_llm(parsed, account.max_material_chars)
+        infos = [AttachmentInfo(a.index, a.filename, a.content_type, a.size) for a in parsed.attachments]
+        req = self.composer.prepare(kind, parsed.instruction, parsed.args, material, infos)
+        estimated = self.composer.estimate_tokens(req)
+        ok, quota_msg = self._quota_ok(account, account_id, estimated)
+        if not ok:
+            html_body, text_body = render_notice("今日模型配额已满", [quota_msg, "请明天再试，或调高该账号的 daily_max_calls / daily_max_tokens。"])
+            return None, CommandReply(subject, html_body, text_body)
+        usage_id = self.db.record_api_usage(account_id, task["id"], estimated, self.cfg.llm.generate_model)
+        spec, actual = self.composer.run(req)      # LLMError / ComposeError 向上抛 → attempts
+        self.db.update_api_usage_actual(usage_id, actual)
+        return spec, None
+
+    def _resolve_attachments(self, account: AccountConfig, parsed: ParsedCommand,
+                             spec: MailSpec) -> tuple[list[tuple[str, str, bytes]], list[str]]:
+        """按规格索引取附件内容；超过单附件上限的跳过并说明。"""
+        limit = account.max_attachment_mb * 1024 * 1024
+        files: list[tuple[str, str, bytes]] = []
+        skipped: list[str] = []
+        for idx in spec.attachments:
+            ref = parsed.attachments[idx]
+            data = ref.read()
+            if len(data) > limit:
+                skipped.append(f"{ref.filename}（{len(data) // 1024} KB，超过 {account.max_attachment_mb} MB 上限）")
+                continue
+            files.append((ref.filename, ref.content_type, data))
+        return files, skipped
 
     def _collect_status(self, account: AccountConfig, account_id: int) -> dict:
         calls, tokens = self.db.today_usage(account_id)
@@ -356,14 +449,15 @@ class Engine:
 
     def _enqueue_command_reply(self, account: AccountConfig, account_id: int, task: sqlite3.Row,
                                msg: Message, parsed: ParsedCommand, to_addr: str,
-                               subject: str, html_body: str, text_body: str, message_id: str) -> None:
+                               reply: CommandReply, message_id: str) -> None:
         """生成完整 .eml → 校验不变量 → 落盘 → 入 outbox（dedup_key 幂等）。"""
         raw_reply = build_reply(
-            account=account, to_addr=to_addr, subject=subject,
-            html_body=html_body, text_body=text_body,
+            account=account, to_addr=to_addr, subject=reply.subject,
+            html_body=reply.html, text_body=reply.text,
             in_reply_to=str(msg.get("Message-ID") or "").strip(),
             references=str(msg.get("References") or "").strip(),
             command=parsed.name or parsed.raw_name or "",
+            rfc822_attachments=[reply.draft] if reply.draft else None,
         )
         validate_reply(raw_reply, to_addr, account.max_mime_mb * 1024 * 1024)
         out_dir = self.cfg.outbox_dir / account.name
@@ -372,10 +466,10 @@ class Engine:
         path.write_bytes(raw_reply)
         self.db.enqueue_outbox(
             account_id=account_id, task_id=task["id"], to_addr=to_addr,
-            subject=subject, body="", scheduled_time=now_str(),
+            subject=reply.subject, body="", scheduled_time=now_str(),
             dedup_key=f"cmd:{account_id}:{message_id}", raw_path=str(path),
         )
-        logger.info("命令回复已入队：task=%s to=%s subject=%s", task["id"], to_addr, subject[:80])
+        logger.info("命令回复已入队：task=%s to=%s subject=%s", task["id"], to_addr, reply.subject[:80])
 
     def _finish_silently(self, account: AccountConfig, account_id: int, task: sqlite3.Row,
                          imap: ImapClient, message_id: str, outcome: str, reason: str) -> None:

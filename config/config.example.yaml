@@ -33,6 +33,10 @@ llm:
   max_retries: 2
   # API 支持 JSON 模式时开启；不支持会自动降级为纯提示词约束
   json_mode: true
+  # agent 生成类命令（#compose / #summarize）：输出远比分类长，单独配置模型与预算
+  generate_model_name: ""          # 留空同 model_name；可指定更强的模型
+  generate_max_tokens: 2000
+  generate_timeout_seconds: 90
 
 accounts:
   - name: main

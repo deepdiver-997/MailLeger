@@ -12,11 +12,23 @@ from pathlib import Path
 from unittest import mock
 
 from src import engine as engine_module
+from src.classifier import LLMError
+from src.composer import SpecLimits, parse_mail_spec
 from src.config import AccountConfig, AppConfig, LLMConfig
 from src.db import Database
 from src.engine import Engine
 
 REQUESTER = "sakura@example.com"
+
+_SPEC_OBJ = {
+    "template": "card", "subject": "周报 W42", "to": ["boss@example.com"],
+    "blocks": [{"type": "paragraph", "text": "本周完成 **P1**。"}], "attachments": [],
+}
+
+
+def _spec(attachments=()):
+    obj = dict(_SPEC_OBJ, attachments=list(attachments))
+    return parse_mail_spec(obj, SpecLimits(), available_attachments=max(1, len(attachments)))
 
 
 def _cfg(tmpdir: str) -> AppConfig:
@@ -169,9 +181,9 @@ class TestAgentEngine(unittest.TestCase):
         self.assertIn("未知命令 #foobar", html)
 
     def test_disabled_command_gets_notice(self) -> None:
-        self._run("5", _mail(REQUESTER, "#compose 周报"), REQUESTER, "#compose 周报")
+        self._run("5", _mail(REQUESTER, "#rewrite 改写"), REQUESTER, "#rewrite 改写")
         reply = self._reply_message(self._outbox()[0])
-        self.assertEqual(str(reply["Subject"]), "Re: 周报")
+        self.assertEqual(str(reply["Subject"]), "Re: 改写")
         self.assertIn("尚未启用", reply.get_body(("plain",)).get_content())
 
     def test_status_reply_masks_whitelist(self) -> None:
@@ -224,6 +236,106 @@ class TestAgentEngine(unittest.TestCase):
         text = self._reply_message(self._outbox()[0]).get_body(("plain",)).get_content()
         self.assertIn("处理失败", text)
         self.assertIn("boom", text)
+
+    # ---- 需要模型的命令（Composer.run 打桩，不触网）-----------------------
+    def _enable_llm(self) -> None:
+        self.cfg.llm.api_key = "test-key"
+
+    def _plain(self, row) -> str:
+        return self._reply_message(row).get_body(("plain",)).get_content()
+
+    def test_compose_reply_carries_draft_eml_and_books_usage(self) -> None:
+        self._enable_llm()
+        with mock.patch.object(engine_module.Composer, "run", return_value=(_spec(), 321)) as run:
+            _, outcome, _, tid = self._run("20", _mail(REQUESTER, "#compose 周报", body="写一封本周周报"),
+                                           REQUESTER, "#compose 周报")
+        self.assertEqual(outcome, "command")
+        run.assert_called_once()
+        reply = self._reply_message(self._outbox()[0])
+        self.assertEqual(str(reply["Subject"]), "Re: 周报")
+        self.assertEqual(str(reply["To"]), REQUESTER)
+        self.assertEqual(reply.get_content_type(), "multipart/mixed")
+        self.assertIn("Leger 已按指令生成草稿", reply.get_body(("html",)).get_content())
+        atts = list(reply.iter_attachments())
+        self.assertEqual([(a.get_content_type(), a.get_filename()) for a in atts], [("message/rfc822", "draft.eml")])
+        draft = atts[0].get_content()
+        self.assertEqual(str(draft["From"]), REQUESTER)              # 草稿以请求者身份起草
+        self.assertEqual(str(draft["To"]), "boss@example.com")
+        self.assertEqual(str(draft["Subject"]), "周报 W42")
+        self.assertEqual(str(draft["X-Leger-Draft"]), "1")
+        self.assertIn("<strong>P1</strong>", draft.get_body(("html",)).get_content())
+        self.assertEqual(self.db.today_usage(self.account_id)[0], 1)   # 预留记账
+        row = self.db.conn.execute("SELECT actual_tokens FROM api_usage WHERE task_id=?", (tid,)).fetchone()
+        self.assertEqual(row["actual_tokens"], 321)                   # 实际消耗回填
+
+    def test_compose_attaches_selected_attachment_from_command_mail(self) -> None:
+        self._enable_llm()
+        m = EmailMessage()
+        m["From"], m["To"], m["Subject"], m["Message-ID"] = REQUESTER, "leger@example.com", "#compose 发报告", "<m21@example.com>"
+        m.set_content("把附件带上")
+        m.add_attachment(b"PDFDATA", maintype="application", subtype="pdf", filename="report.pdf")
+        with mock.patch.object(engine_module.Composer, "run", return_value=(_spec(attachments=[0]), 10)) as run:
+            self._run("21", m.as_bytes(), REQUESTER, "#compose 发报告", mid="<m21@example.com>")
+        req = run.call_args.args[0]
+        self.assertIn("[0] report.pdf (application/pdf", req.messages[1]["content"])   # 模型看到附件清单
+        reply = self._reply_message(self._outbox()[0])
+        draft = list(reply.iter_attachments())[0].get_content()
+        inner = list(draft.iter_attachments())
+        self.assertEqual([a.get_filename() for a in inner], ["report.pdf"])
+        self.assertEqual(inner[0].get_content(), b"PDFDATA")
+        self.assertIn("report.pdf", self._plain(self._outbox()[0]))
+
+    def test_compose_without_instruction_gets_notice_without_llm(self) -> None:
+        self._enable_llm()
+        with mock.patch.object(engine_module.Composer, "run") as run:
+            self._run("22", _mail(REQUESTER, "#compose", body=""), REQUESTER, "#compose")
+        run.assert_not_called()
+        self.assertIn("需要指令", self._plain(self._outbox()[0]))
+
+    def test_compose_quota_exhausted_notice_without_llm(self) -> None:
+        self._enable_llm()
+        self.acc = _agent(daily_max_calls=0)
+        with mock.patch.object(engine_module.Composer, "run") as run:
+            _, outcome, _, _ = self._run("23", _mail(REQUESTER, "#compose x", body="写"), REQUESTER, "#compose x")
+        run.assert_not_called()
+        self.assertEqual(outcome, "command")                      # 确定性结果，直接终结不重试
+        self.assertIn("配额已满", self._plain(self._outbox()[0]))
+
+    def test_compose_without_api_key_gets_notice(self) -> None:
+        with mock.patch.object(engine_module.Composer, "run") as run:
+            self._run("27", _mail(REQUESTER, "#compose x", body="写"), REQUESTER, "#compose x")
+        run.assert_not_called()
+        self.assertIn("未配置大模型", self._plain(self._outbox()[0]))
+
+    def test_summarize_requires_material(self) -> None:
+        self._enable_llm()
+        with mock.patch.object(engine_module.Composer, "run") as run:
+            self._run("24", _mail(REQUESTER, "#summarize", body="只有指令没有素材"), REQUESTER, "#summarize")
+        run.assert_not_called()
+        self.assertIn("需要素材", self._plain(self._outbox()[0]))
+
+    def test_summarize_with_material_replies_without_draft(self) -> None:
+        self._enable_llm()
+        body = "重点看截止日期\n---------- Forwarded message ---------\nFrom: a@b.c\n\n正文内容"
+        with mock.patch.object(engine_module.Composer, "run", return_value=(_spec(), 5)) as run:
+            self._run("25", _mail(REQUESTER, "Fwd: #summarize", body=body), REQUESTER, "Fwd: #summarize")
+        req = run.call_args.args[0]
+        self.assertEqual(req.kind, "summarize")
+        user_prompt = req.messages[1]["content"]
+        self.assertIn("重点看截止日期", user_prompt)                # 指令
+        self.assertIn("正文内容", user_prompt)                       # 素材
+        reply = self._reply_message(self._outbox()[0])
+        self.assertEqual(reply.get_content_type(), "multipart/alternative")   # 总结不带 draft.eml
+        self.assertIn("结构化总结", self._plain(self._outbox()[0]))
+
+    def test_llm_error_keeps_pending_and_counts_attempt(self) -> None:
+        self._enable_llm()
+        with mock.patch.object(engine_module.Composer, "run", side_effect=LLMError("timeout")):
+            ok, _, _, tid = self._run("26", _mail(REQUESTER, "#compose x", body="写"), REQUESTER, "#compose x")
+        self.assertFalse(ok)
+        self.assertEqual(self.db.get_task(tid)["status"], "pending")
+        self.assertEqual(self.db.get_task(tid)["attempts"], 1)
+        self.assertEqual(self._outbox(), [])
 
     # ------------------------------------------------------------------
     def test_send_outbox_sends_raw_then_unlinks_file(self) -> None:

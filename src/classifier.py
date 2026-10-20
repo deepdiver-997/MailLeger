@@ -133,16 +133,25 @@ class LLMClassifier:
         return self._content(data).strip(), self._actual_tokens(data)
 
     # ------------------------------------------------------------------
+    # 通用补全（agent 生成任务复用同一套重试 / JSON 模式降级 / 用量回填）
+    # ------------------------------------------------------------------
+    def chat_text(self, payload: dict, timeout: Optional[int] = None) -> tuple[str, Optional[int]]:
+        """发送补全请求，返回 (content, 实际消耗 token)；失败抛 LLMError。"""
+        data = self._chat(payload, timeout=timeout)
+        return self._content(data), self._actual_tokens(data)
+
+    # ------------------------------------------------------------------
     # HTTP 细节
     # ------------------------------------------------------------------
-    def _chat(self, payload: dict) -> dict:
+    def _chat(self, payload: dict, timeout: Optional[int] = None) -> dict:
         """带超时与重试的补全请求。API 不支持 response_format 时自动降级重试。"""
         url = self.llm.base_url.rstrip("/") + "/chat/completions"
         headers = {"Authorization": f"Bearer {self.llm.api_key}"} if self.llm.api_key else {}
+        timeout = timeout or self.llm.timeout_seconds
         attempts = 0
         while True:
             try:
-                resp = requests.post(url, json=payload, headers=headers, timeout=self.llm.timeout_seconds)
+                resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
             except requests.RequestException as e:
                 attempts += 1
                 if attempts > self.llm.max_retries:

@@ -13,11 +13,12 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from email.message import Message
-from typing import Optional
+from typing import Iterator, Optional
 
 from .config import AccountConfig, normalize_address
+from .imap_worker import extract_text_body
 
 
 # ----------------------------------------------------------------------
@@ -29,7 +30,7 @@ class CommandSpec:
     name: str
     syntax: str
     description: str
-    enabled: bool = True        # False：识别但回复"尚未启用"（后续版本接入大模型）
+    enabled: bool = True        # False：识别但回复"尚未启用"（后续版本接入）
     needs_llm: bool = False
     aliases: tuple[str, ...] = ()
 
@@ -39,12 +40,12 @@ COMMANDS: dict[str, CommandSpec] = {
     "status": CommandSpec("status", "#status", "今日大模型用量/配额、待处理任务与发送队列"),
     "compose": CommandSpec(
         "compose", "#compose [主题]",
-        "按正文中的指令生成一封排版好的邮件；分隔线下方可附参考素材",
-        enabled=False, needs_llm=True),
+        "按正文中的指令生成一封排版好的邮件（回信正文即预览，附 draft.eml）；分隔线下方可附参考素材",
+        needs_llm=True),
     "summarize": CommandSpec(
         "summarize", "#summarize",
         "总结分隔线下方或 .eml 附件中的邮件素材",
-        enabled=False, needs_llm=True),
+        needs_llm=True),
     "rewrite": CommandSpec(
         "rewrite", "#rewrite [要求]",
         "按要求改写转发来的邮件，默认保留原附件",
@@ -201,6 +202,67 @@ def mask_address(addr: str) -> str:
 
 
 # ----------------------------------------------------------------------
+# 附件与素材
+# ----------------------------------------------------------------------
+
+@dataclass
+class AttachmentRef:
+    """命令邮件（或其 rfc822 素材）里的一个附件；内容延迟到被选中时才解码。"""
+    index: int
+    source: str          # material | command
+    filename: str
+    content_type: str
+    size: int            # 由编码后长度估算；精确大小在 read() 之后再校验
+    part: Message
+
+    def read(self) -> bytes:
+        payload = self.part.get_payload(decode=True)
+        return bytes(payload) if payload else b""
+
+
+def _iter_attachment_parts(container: Message) -> Iterator[Message]:
+    iter_attachments = getattr(container, "iter_attachments", None)
+    if iter_attachments is None:
+        return
+    for part in iter_attachments():
+        if part.is_multipart() or part.get_content_type() == "message/rfc822":
+            continue   # rfc822 是素材本体，不当附件；嵌套 multipart 不展开
+        yield part
+
+
+def collect_attachments(msg: Message, material_message: Optional[Message]) -> list[AttachmentRef]:
+    """先列素材（rfc822 附件）自己的附件，再列命令邮件直接携带的附件；索引即模型可引用的编号。"""
+    refs: list[AttachmentRef] = []
+    sources: list[tuple[str, Message]] = []
+    if material_message is not None:
+        sources.append(("material", material_message))
+    sources.append(("command", msg))
+    for source, container in sources:
+        for part in _iter_attachment_parts(container):
+            encoded = part.get_payload()
+            encoded_len = len(encoded) if isinstance(encoded, str) else 0
+            cte = _hdr(part, "Content-Transfer-Encoding").lower()
+            size = encoded_len * 3 // 4 if cte == "base64" else encoded_len
+            refs.append(AttachmentRef(
+                index=len(refs), source=source,
+                filename=part.get_filename() or f"attachment-{len(refs) + 1}",
+                content_type=part.get_content_type(), size=size, part=part,
+            ))
+    return refs
+
+
+def material_text_for_llm(parsed: "ParsedCommand", max_chars: int) -> str:
+    """交给模型的素材文本：rfc822 素材取头部摘要 + 正文；否则取分隔线下方文本。截断到 max_chars。"""
+    if parsed.material_message is not None:
+        m = parsed.material_message
+        head = "\n".join(f"{k}: {_hdr(m, k)}" for k in ("From", "To", "Date", "Subject")) + "\n\n"
+        text = head + extract_text_body(m, max_chars)
+    else:
+        text = parsed.material_text
+    return text[:max_chars]
+
+
+# ----------------------------------------------------------------------
 # 整封命令邮件的解析结果
 # ----------------------------------------------------------------------
 
@@ -214,10 +276,15 @@ class ParsedCommand:
     material_text: str                   # 分隔线之下的素材文本（rfc822 附件存在时为空）
     material_message: Optional[Message]  # message/rfc822 附件
     used_default: bool                   # 是否因未写命令而使用 default_command
+    attachments: list[AttachmentRef] = field(default_factory=list)
 
     @property
     def spec(self) -> Optional[CommandSpec]:
         return COMMANDS.get(self.name) if self.name else None
+
+    @property
+    def has_material(self) -> bool:
+        return self.material_message is not None or bool(self.material_text.strip())
 
 
 def parse_command_mail(msg: Message, body_text: str, account: AccountConfig) -> ParsedCommand:
@@ -233,5 +300,5 @@ def parse_command_mail(msg: Message, body_text: str, account: AccountConfig) -> 
     return ParsedCommand(
         raw_name=sp.raw_name, name=name, args=sp.args, clean_subject=sp.clean_subject,
         instruction=instruction, material_text=material, material_message=rfc822,
-        used_default=used_default,
+        used_default=used_default, attachments=collect_attachments(msg, rfc822),
     )

@@ -46,8 +46,9 @@ AI 邮件助手：通过 IMAP 定时扫描邮箱，先用规则、再用大模�
 | `src/imap_worker.py` | IMAP 拉取（UID + PEEK）、正文提取（纯文本优先，HTML 剥标签） |
 | `src/classifier.py` | 规则预筛选 + 大模型分类/摘要（超时、重试、JSON 模式降级） |
 | `src/mailer.py` | 通知/汇总 HTML 模板（转义截断）+ SMTP 发送（SSL/STARTTLS；`send_raw` 发送预生成 .eml） |
-| `src/commands.py` | agent：主题 `#命令` 解析、正文"指令/素材"切分、白名单鉴权、循环守卫（纯函数） |
-| `src/mime_builder.py` | agent：回复 .eml 构建（线程头 + 守卫头）、发送前不变量校验、help/status/说明渲染 |
+| `src/commands.py` | agent：主题 `#命令` 解析、正文"指令/素材"切分、附件清单、白名单鉴权、循环守卫（纯函数） |
+| `src/composer.py` | agent：MailSpec（模型只产出的 JSON 规格）严格校验、固定提示词、带反馈的一次重试 |
+| `src/mime_builder.py` | agent：MailSpec → 邮件 HTML/纯文本渲染（模板调色板、内联 CSS、转义）、草稿 .eml、回复 .eml 构建与发送前校验 |
 | `src/engine.py` | 编排：扫描事务、决策链、配额、入队、发送、每日汇总；agent 账号分流到命令处理 |
 | `src/scheduler.py` | `watch` 模式：轮询扫描 + 到点汇总 |
 | `src/cli.py` | 命令行入口与日志配置 |
@@ -113,6 +114,7 @@ python3 -m src.cli watch               # 常驻运行（轮询 + 定时汇总）
 | `llm.base_url` / `api_key` / `model_name` | OpenAI 兼容 API | — |
 | `llm.max_tokens` / `timeout_seconds` / `max_retries` | 100 / 30 / 2 | |
 | `llm.json_mode` | API 支持 JSON 模式则开启，不支持自动降级 | true |
+| `llm.generate_model_name` / `generate_max_tokens` / `generate_timeout_seconds` | agent 生成类命令（`#compose`/`#summarize`）的模型（留空同 `model_name`）、输出预算与超时 | — / 2000 / 90 |
 | `accounts[].name/imap_host/imap_port/imap_user/imap_password` | IMAP 账号 | |
 | `accounts[].smtp_*` | SMTP（`smtp_use_ssl` 或 `smtp_starttls`） | |
 | `accounts[].notification_to` | 重要邮件通知的内部专属邮箱（必填） | |
@@ -139,9 +141,11 @@ python3 -m src.cli watch               # 常驻运行（轮询 + 定时汇总）
 | --- | --- | --- |
 | `#help` | 可用 | 命令列表与语法；未知命令、主题无命令时也回它 |
 | `#status` | 可用 | 今日模型用量/配额、待处理任务、发送队列、白名单（脱敏） |
-| `#compose [主题]` | 即将支持 | 按指令生成排版好的邮件（模型只产 JSON 规格，MIME 由代码生成） |
-| `#summarize` | 即将支持 | 总结分隔线下方或 .eml 附件中的素材 |
+| `#compose [主题]` | 可用 | 按正文指令生成排版好的邮件：回信正文即预览（可直接转发），附 `draft.eml`（From 是你、To 来自指令），可带上命令邮件里的附件 |
+| `#summarize` | 可用 | 对分隔线下方或 .eml 附件中的素材做结构化总结（概述 / 要点 / 时间节点 / 待决事项） |
 | `#rewrite [要求]`（别名 `#forward`） | 即将支持 | 按要求改写转发来的邮件，默认保留原附件 |
+
+**生成类命令的边界**：模型只产出一个 JSON 规格（`MailSpec`：模板、主题、收件人、内容块、附件索引），经 `composer.py` 严格校验（块类型、长度、数量、链接只允许 `http(s)`/`mailto`、收件人格式、附件索引），不合法时带错误反馈重试一次；MIME 由 `mime_builder.py` 的确定性代码渲染（表格布局 + 内联 CSS，四套模板 `card`/`report`/`notice`/`plain`），所有字段转义。素材用 `<<<MATERIAL … MATERIAL>>>` 包裹并在提示词里声明为数据。生成调用走与分类相同的配额账本（`api_usage`），模型与 token 预算单独配置（`llm.generate_*`）。
 
 崩溃语义与 monitor 一致：来信原始 MIME 落盘到 `data/raw/<账号>/`（恢复时不重拉，完成后删除），回复 .eml 写到 `data/outbox/<账号>/` 并以 `dedup_key = cmd:{account}:{Message-ID}` 入队——崩溃重跑不会回两封。需要模型的命令失败会累计 `scan_tasks.attempts`，到 `max_command_attempts` 后回"处理失败"说明并终结，防止一个坏任务把每日配额烧光。
 

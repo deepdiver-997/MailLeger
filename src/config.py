@@ -72,6 +72,10 @@ llm:
   max_retries: 2
   # API 支持 JSON 模式时开启；不支持会自动降级为纯提示词约束
   json_mode: true
+  # agent 生成类命令（#compose / #summarize）：输出远比分类长，单独配置模型与预算
+  generate_model_name: ""
+  generate_max_tokens: 2000
+  generate_timeout_seconds: 90
 
 accounts:
   - name: main
@@ -189,6 +193,14 @@ class LLMConfig:
     timeout_seconds: int = 30
     max_retries: int = 2
     json_mode: bool = True
+    # --- agent 生成任务（#compose / #summarize）专用：输出远比分类长 ---
+    generate_model_name: str = ""          # 留空同 model_name；可指定更强的模型
+    generate_max_tokens: int = 2000
+    generate_timeout_seconds: int = 90
+
+    @property
+    def generate_model(self) -> str:
+        return self.generate_model_name or self.model_name
 
 
 @dataclass
@@ -365,6 +377,9 @@ def load_config(path: str | Path) -> AppConfig:
         timeout_seconds=_get_int(llm_raw, "timeout_seconds", 30),
         max_retries=_get_int(llm_raw, "max_retries", 2),
         json_mode=_get_bool(llm_raw, "json_mode", True),
+        generate_model_name=_get_str(llm_raw, "generate_model_name", ""),
+        generate_max_tokens=_get_int(llm_raw, "generate_max_tokens", 2000),
+        generate_timeout_seconds=_get_int(llm_raw, "generate_timeout_seconds", 90),
     )
 
     accounts_raw = raw.get("accounts")
