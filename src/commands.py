@@ -76,6 +76,11 @@ _SUBJECT_PREFIX_RE = re.compile(
     r"^\s*(?:(?:re|fw|fwd|aw|wg|转发|回复|答复)\s*[:：]\s*|\[[^\]]{1,30}\]\s*)+",
     re.IGNORECASE)
 _COMMAND_RE = re.compile(r"^\s*#\s*([A-Za-z][\w-]*)\b[\s:：,，-]*(.*)$", re.DOTALL)
+# 主题任意位置的 #词（前面不能紧贴字母/数字/#，避免 C# / ## 误判）
+_ANYWHERE_RE = re.compile(r"(?<![\w#])#\s*([A-Za-z][\w-]*)")
+_SEP_RE = re.compile(r"^[\s:：,，-]+")
+# 已知命令词（含别名），长的优先，用于拆"粘连"：#summarizeFw → summarize + Fw
+_KNOWN_WORDS = sorted({*COMMANDS.keys(), *_ALIAS_INDEX.keys()}, key=len, reverse=True)
 
 
 @dataclass
@@ -86,14 +91,45 @@ class SubjectParse:
     clean_subject: str          # 去掉前缀与 #命令 后的主题，用于回复主题
 
 
+def _strip_prefixes(text: str) -> str:
+    return _SUBJECT_PREFIX_RE.sub("", (text or "").strip(), count=1).strip()
+
+
+def _split_sticky(word: str) -> tuple[Optional[str], str]:
+    """'summarizeFw' → ('summarize', 'Fw')；精确命中 → (word, '')；不是已知命令 → (None, word)。
+
+    手机上把 #命令 直接贴在预填的 "Fw: …" 前面没加空格是最常见的写法，必须容忍。
+    """
+    lower = word.lower()
+    if resolve_command_name(lower):
+        return lower, ""
+    for cand in _KNOWN_WORDS:
+        if lower.startswith(cand) and len(lower) > len(cand):
+            return cand, word[len(cand):]
+    return None, word
+
+
 def parse_subject(subject: str) -> SubjectParse:
-    stripped = _SUBJECT_PREFIX_RE.sub("", (subject or "").strip(), count=1).strip()
+    stripped = _strip_prefixes((subject or "").replace("＃", "#"))
     m = _COMMAND_RE.match(stripped)
-    if not m:
-        return SubjectParse(None, None, "", stripped)
-    raw = m.group(1).lower()
-    args = m.group(2).strip()
-    return SubjectParse(raw, resolve_command_name(raw), args, args)
+    if m:
+        word, tail = _split_sticky(m.group(1))
+        if word is None:
+            # 起始处写了一个不认识的命令：如实报告，让用户知道拼错了
+            args = m.group(2).strip()
+            return SubjectParse(m.group(1).lower(), None, args, args)
+        rest = _strip_prefixes(_SEP_RE.sub("", (tail + stripped[m.end(1):]).strip(), count=1))
+        return SubjectParse(word, resolve_command_name(word), rest, rest)
+    # 起始处没有命令：在主题任意位置找一个已知命令词（手机上常把 #命令 追加到末尾）；
+    # 只认已知命令，避免转发主题里本来就有的 "#foo" 被当成命令
+    for m in _ANYWHERE_RE.finditer(stripped):
+        word, tail = _split_sticky(m.group(1))
+        if word is None:
+            continue
+        rest = re.sub(r"\s{2,}", " ", f"{stripped[:m.start()]} {tail}{stripped[m.end():]}").strip()
+        rest = _strip_prefixes(_SEP_RE.sub("", rest, count=1))
+        return SubjectParse(word, resolve_command_name(word), rest, rest)
+    return SubjectParse(None, None, "", stripped)
 
 
 # ----------------------------------------------------------------------

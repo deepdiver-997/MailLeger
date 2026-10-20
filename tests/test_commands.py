@@ -47,6 +47,33 @@ class TestParseSubject(unittest.TestCase):
     def test_space_after_hash(self) -> None:
         self.assertEqual(cmd.parse_subject("# status").name, "status")
 
+    def test_sticky_command_glued_to_forward_prefix(self) -> None:
+        # 手机上把 #summarize 直接贴在预填的 "Fw: …" 前面（线上实测踩到的写法）
+        sp = cmd.parse_subject("#summarizeFw: 你最近使用 Apple\xa0帳户下載的項目")
+        self.assertEqual((sp.raw_name, sp.name), ("summarize", "summarize"))
+        self.assertEqual(sp.clean_subject, "你最近使用 Apple\xa0帳户下載的項目")
+        sp = cmd.parse_subject("#composeRe: 关于预算")
+        self.assertEqual((sp.name, sp.args), ("compose", "关于预算"))
+
+    def test_fullwidth_hash(self) -> None:
+        self.assertEqual(cmd.parse_subject("＃help").name, "help")
+        self.assertEqual(cmd.parse_subject("转发：＃summarize 原主题").clean_subject, "原主题")
+
+    def test_known_command_anywhere_in_subject(self) -> None:
+        sp = cmd.parse_subject("Fw: 季度报告 #summarize")
+        self.assertEqual(sp.name, "summarize")
+        self.assertEqual(sp.clean_subject, "季度报告")
+        sp = cmd.parse_subject("Fw: 季度报告 #forward 精简一下")
+        self.assertEqual((sp.name, sp.clean_subject), ("rewrite", "季度报告 精简一下"))
+
+    def test_unknown_hash_word_inside_subject_is_not_a_command(self) -> None:
+        # 转发主题里本来就有的 #foo 不能被当成命令
+        sp = cmd.parse_subject("Fw: Issue #foo needs review")
+        self.assertIsNone(sp.raw_name)
+        self.assertEqual(sp.clean_subject, "Issue #foo needs review")
+        # 但起始处的未知命令仍如实报告
+        self.assertEqual(cmd.parse_subject("#foobar").raw_name, "foobar")
+
 
 class TestSplitBody(unittest.TestCase):
     def _check(self, text: str, instruction: str, material_prefix: str) -> None:
