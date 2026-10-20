@@ -35,5 +35,59 @@ class TestConfigEnv(unittest.TestCase):
             cfgmod._parse_account({"imap_host": "imap.example.com"}, 0)
 
 
+_AGENT_BASE = {
+    "name": "leger", "role": "agent",
+    "imap_host": "imap.example.com", "imap_user": "leger@example.com",
+    "smtp_host": "smtp.example.com", "smtp_user": "leger@example.com",
+    "allowed_senders": ["Sakura <Sakura@Example.com>", "sakura@example.com", "other@example.com"],
+}
+
+
+class TestAgentAccountConfig(unittest.TestCase):
+    def test_agent_normalizes_and_dedupes_whitelist_and_needs_no_notification_to(self) -> None:
+        acc = cfgmod._parse_account(dict(_AGENT_BASE), 0)
+        self.assertEqual(acc.role, "agent")
+        self.assertEqual(acc.allowed_senders, ["sakura@example.com", "other@example.com"])
+        self.assertEqual(acc.default_command, "help")
+        self.assertEqual(acc.reply_from, "leger@example.com")
+
+    def test_whitelist_accepts_comma_string(self) -> None:
+        raw = dict(_AGENT_BASE, allowed_senders="a@x.y, B@X.Y")
+        self.assertEqual(cfgmod._parse_account(raw, 0).allowed_senders, ["a@x.y", "b@x.y"])
+
+    def test_agent_requires_whitelist(self) -> None:
+        with self.assertRaises(ConfigError):
+            cfgmod._parse_account(dict(_AGENT_BASE, allowed_senders=[]), 0)
+
+    def test_agent_requires_smtp_host(self) -> None:
+        with self.assertRaises(ConfigError):
+            cfgmod._parse_account(dict(_AGENT_BASE, smtp_host=""), 0)
+
+    def test_agent_rejects_self_in_whitelist(self) -> None:
+        with self.assertRaises(ConfigError):
+            cfgmod._parse_account(dict(_AGENT_BASE, allowed_senders=["LEGER@example.com"]), 0)
+
+    def test_invalid_role_and_default_command(self) -> None:
+        with self.assertRaises(ConfigError):
+            cfgmod._parse_account(dict(_AGENT_BASE, role="robot"), 0)
+        with self.assertRaises(ConfigError):
+            cfgmod._parse_account(dict(_AGENT_BASE, default_command="status"), 0)
+        self.assertEqual(cfgmod._parse_account(dict(_AGENT_BASE, default_command="#Compose"), 0).default_command,
+                         "compose")
+
+    def test_monitor_still_requires_notification_to(self) -> None:
+        raw = {"name": "m", "imap_host": "h", "imap_user": "u@x.y"}
+        with self.assertRaises(ConfigError):
+            cfgmod._parse_account(raw, 0)
+        acc = cfgmod._parse_account(dict(raw, notification_to="to@x.y"), 0)
+        self.assertEqual(acc.role, "monitor")
+        self.assertEqual(acc.allowed_senders, [])
+
+    def test_normalize_address(self) -> None:
+        self.assertEqual(cfgmod.normalize_address('"Sakura" <SAKURA@Example.com>'), "sakura@example.com")
+        self.assertEqual(cfgmod.normalize_address("  plain@x.y "), "plain@x.y")
+        self.assertEqual(cfgmod.normalize_address(None), "")
+
+
 if __name__ == "__main__":
     unittest.main()

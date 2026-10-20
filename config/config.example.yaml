@@ -63,3 +63,43 @@ accounts:
     # 处理完成后对服务器邮件的动作：mark_seen 或 move（移动到 processed_folder）
     on_processed: mark_seen
     processed_folder: Processed
+
+  # ---------------------------------------------------------------------
+  # 命令邮箱（role: agent）：只响应 allowed_senders 发来的 #命令 邮件，
+  # 结果只会回给发出命令的人；非白名单来信静默丢弃、不回、不弹。
+  # 前提：邮件服务端已拒绝"公网未认证会话携带本域发件人"，From 才可作为鉴权依据。
+  # ---------------------------------------------------------------------
+  - name: leger
+    role: agent
+    imap_host: imap.example.com
+    imap_port: 993
+    imap_use_ssl: true
+    imap_user: leger@example.com
+    imap_password: ${LEGER_IMAP_PASSWORD}
+
+    smtp_host: smtp.example.com
+    smtp_port: 465
+    smtp_use_ssl: true
+    smtp_starttls: false
+    smtp_user: leger@example.com
+    smtp_password: ${LEGER_SMTP_PASSWORD}
+
+    # 白名单：允许下命令的地址（大小写不敏感）；不能包含本账号自己
+    allowed_senders:
+      - you@internal.example.com
+    reply_display_name: Leger
+    # 白名单来信但主题没写 #命令 时：help | compose
+    default_command: help
+    # 需要大模型的命令连续失败 N 次后回"处理失败"说明并终结，避免烧光配额
+    max_command_attempts: 3
+    # 交给大模型的素材上限（字符）/ 单附件上限 / 生成邮件总体积上限（MB）
+    max_material_chars: 12000
+    max_attachment_mb: 10
+    max_mime_mb: 25
+
+    # agent 账号的模型配额同样生效
+    daily_max_calls: 200
+    daily_max_tokens: 500000
+
+    on_processed: move
+    processed_folder: Done

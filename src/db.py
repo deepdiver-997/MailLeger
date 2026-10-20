@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS scan_tasks (
     priority TEXT,
     reason TEXT,
     raw_json TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (account_id, email_uid)
@@ -68,6 +69,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     to_addr TEXT NOT NULL,
     subject TEXT NOT NULL,
     body TEXT NOT NULL,
+    raw_path TEXT,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
     created_at TEXT NOT NULL,
     scheduled_time TEXT,
@@ -88,6 +90,12 @@ CREATE TABLE IF NOT EXISTS api_usage (
 );
 CREATE INDEX IF NOT EXISTS idx_api_usage_time ON api_usage (account_id, request_time);
 """
+
+# 老库增量迁移：(表, 列, 列定义)。CREATE TABLE IF NOT EXISTS 不会给已存在的表补列。
+_COLUMN_MIGRATIONS = (
+    ("scan_tasks", "attempts", "INTEGER NOT NULL DEFAULT 0"),   # agent 命令的失败计数
+    ("outbox", "raw_path", "TEXT"),                             # 预生成 .eml 的路径（agent 回复）
+)
 
 
 def now_str() -> str:
@@ -110,7 +118,15 @@ class Database:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(_SCHEMA)
+        self._ensure_columns()
         self.conn.commit()
+
+    def _ensure_columns(self) -> None:
+        """给旧版本数据库补列（幂等）。"""
+        for table, column, definition in _COLUMN_MIGRATIONS:
+            existing = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def close(self) -> None:
         self.conn.close()
@@ -201,6 +217,23 @@ class Database:
                 (priority, reason, now_str(), task_id),
             )
 
+    def increment_task_attempts(self, task_id: int) -> int:
+        """agent 命令处理失败一次：attempts+1，返回新值（供 max_command_attempts 判断）。"""
+        with self.conn:
+            self.conn.execute(
+                "UPDATE scan_tasks SET attempts=attempts+1, updated_at=? WHERE id=?",
+                (now_str(), task_id),
+            )
+        row = self.conn.execute("SELECT attempts FROM scan_tasks WHERE id=?", (task_id,)).fetchone()
+        return int(row["attempts"]) if row else 0
+
+    def count_pending_tasks(self, account_id: int) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM scan_tasks WHERE account_id=? AND status='pending'",
+            (account_id,),
+        ).fetchone()
+        return int(row["n"])
+
     # ------------------------------------------------------------------
     # processed_messages（Message-ID 去重）
     # ------------------------------------------------------------------
@@ -223,19 +256,23 @@ class Database:
     # ------------------------------------------------------------------
     def enqueue_outbox(self, account_id: int, task_id: Optional[int], to_addr: str,
                        subject: str, body: str, scheduled_time: str,
-                       dedup_key: str) -> Optional[int]:
-        """入队待发邮件；dedup_key 已存在时返回 None（幂等，防止重复发送）。"""
+                       dedup_key: str, raw_path: Optional[str] = None) -> Optional[int]:
+        """入队待发邮件；dedup_key 已存在时返回 None（幂等，防止重复发送）。
+
+        raw_path 非空表示发送预生成的完整 .eml（agent 回复），此时 body 可为空串。
+        """
         if self.conn.execute("SELECT 1 FROM outbox WHERE dedup_key=?", (dedup_key,)).fetchone():
             return None
         with self.conn:
             cur = self.conn.execute(
                 """
                 INSERT INTO outbox
-                    (account_id, task_id, to_addr, subject, body, status,
+                    (account_id, task_id, to_addr, subject, body, raw_path, status,
                      created_at, scheduled_time, retry_count, dedup_key)
-                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, 0, ?)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0, ?)
                 """,
-                (account_id, task_id, to_addr, subject, body, now_str(), scheduled_time, dedup_key),
+                (account_id, task_id, to_addr, subject, body, raw_path, now_str(),
+                 scheduled_time, dedup_key),
             )
         return int(cur.lastrowid)
 
@@ -265,6 +302,28 @@ class Database:
                 "UPDATE outbox SET status='failed', retry_count=retry_count+1 WHERE id=?",
                 (outbox_id,),
             )
+
+    def mark_outbox_dead(self, outbox_id: int, max_retries: int) -> None:
+        """永久失败（违反不变量 / 文件丢失）：把 retry_count 顶到上限，due_outbox 不再捞取。"""
+        with self.conn:
+            self.conn.execute(
+                "UPDATE outbox SET status='failed', retry_count=? WHERE id=?",
+                (max(1, max_retries), outbox_id),
+            )
+
+    def outbox_counts(self, account_id: int, max_retries: int) -> dict[str, int]:
+        """status 回复用：待发（含可重试失败）/ 永久失败 / 今日已发。"""
+        pending = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM outbox WHERE account_id=? AND status IN ('pending','failed') "
+            "AND retry_count < ?", (account_id, max_retries)).fetchone()["n"]
+        failed = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM outbox WHERE account_id=? AND status='failed' AND retry_count >= ?",
+            (account_id, max_retries)).fetchone()["n"]
+        sent_today = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM outbox WHERE account_id=? AND status='sent' "
+            "AND date(sent_time) = date('now', 'localtime')", (account_id,)).fetchone()["n"]
+        return {"outbox_pending": int(pending), "outbox_failed": int(failed),
+                "outbox_sent_today": int(sent_today)}
 
     def summary_enqueued(self, dedup_key: str) -> bool:
         return self.conn.execute(

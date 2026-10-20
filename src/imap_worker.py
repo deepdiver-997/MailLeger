@@ -239,16 +239,20 @@ class ImapClient:
             metas.append(_meta_from_message(uid, resp_line, msg))
         return metas
 
-    def fetch_message(self, uid: str) -> Message:
-        """抓取完整原始邮件（BODY.PEEK[]），解析为 Message 对象。"""
+    def fetch_raw(self, uid: str) -> bytes:
+        """抓取完整原始邮件字节（BODY.PEEK[]），供 agent 落盘缓存与 MIME 级处理。"""
         assert self.conn is not None
         typ, data = self.conn.uid("FETCH", uid, "(BODY.PEEK[])")
         if typ != "OK":
             raise ImapError(f"FETCH 正文失败: {typ}")
         for item in data:
             if isinstance(item, tuple) and len(item) >= 2 and isinstance(item[1], (bytes, bytearray)):
-                return email.message_from_bytes(bytes(item[1]), policy=email.policy.default)
+                return bytes(item[1])
         raise ImapError(f"未获取到 UID {uid} 的邮件数据")
+
+    def fetch_message(self, uid: str) -> Message:
+        """抓取完整原始邮件并解析为 Message 对象。"""
+        return email.message_from_bytes(self.fetch_raw(uid), policy=email.policy.default)
 
     def mark_seen(self, uid: str) -> None:
         """仅在本地决策持久化之后由引擎调用。"""

@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import email.utils
 import logging
 import os
 import re
@@ -21,9 +22,18 @@ logger = logging.getLogger(__name__)
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
+ACCOUNT_ROLES = ("monitor", "agent")
+AGENT_DEFAULT_COMMANDS = ("help", "compose")
+
 
 class ConfigError(Exception):
     """配置缺失或非法。"""
+
+
+def normalize_address(value: str | None) -> str:
+    """把 From 头/配置里的地址规范化为小写纯邮箱（去显示名、去空白），用于白名单比对。"""
+    addr = email.utils.parseaddr(value or "")[1] or (value or "")
+    return addr.strip().lower()
 
 
 DEFAULT_CONFIG_TEMPLATE = """\
@@ -93,6 +103,25 @@ accounts:
     # 处理完成后对服务器邮件的动作：mark_seen 或 move（移动到 processed_folder）
     on_processed: mark_seen
     processed_folder: Processed
+
+  # ---------------------------------------------------------------------
+  # 命令邮箱（role: agent）：只响应 allowed_senders 发来的 #命令 邮件，
+  # 结果只会回给发出命令的人；非白名单来信静默丢弃、不回、不弹。
+  # ---------------------------------------------------------------------
+  # - name: leger
+  #   role: agent
+  #   imap_host: imap.example.com
+  #   imap_user: leger@example.com
+  #   imap_password: ${LEGER_IMAP_PASSWORD}
+  #   smtp_host: smtp.example.com
+  #   smtp_user: leger@example.com
+  #   smtp_password: ${LEGER_SMTP_PASSWORD}
+  #   allowed_senders: [you@example.com]
+  #   reply_display_name: Leger
+  #   default_command: help          # 白名单来信但没带 #命令 时：help | compose
+  #   max_command_attempts: 3        # 需要大模型的命令连续失败 N 次后回错误说明并终结
+  #   on_processed: move
+  #   processed_folder: Done
 """
 
 
@@ -183,6 +212,25 @@ class AccountConfig:
     daily_max_tokens: int = 1_000_000
     on_processed: str = "mark_seen"       # mark_seen | move
     processed_folder: str = "Processed"
+    # --- role: agent（命令邮箱）专用 ---
+    role: str = "monitor"                 # monitor | agent
+    allowed_senders: list[str] = field(default_factory=list)   # 已规范化为小写纯地址
+    reply_display_name: str = "Leger"
+    default_command: str = "help"         # 白名单来信但没带 #命令 时的处理：help | compose
+    max_command_attempts: int = 3         # 需要大模型的命令连续失败 N 次后回错误说明并终结
+    max_material_chars: int = 12000       # 交给大模型的素材上限（字符）
+    max_attachment_mb: int = 10           # 单个附件上限
+    max_mime_mb: int = 25                 # 生成邮件总体积上限
+
+    @property
+    def self_addresses(self) -> set[str]:
+        """本账号自己的所有地址（规范化），用于防自环与白名单互斥校验。"""
+        return {normalize_address(a) for a in (self.imap_user, self.smtp_user, self.notification_from) if a}
+
+    @property
+    def reply_from(self) -> str:
+        """agent 回复 / monitor 通知使用的发件地址。"""
+        return self.notification_from or self.smtp_user or self.imap_user
 
 
 @dataclass
@@ -199,6 +247,30 @@ class AppConfig:
     summary_llm_max_chars: int = 4000
     llm: LLMConfig = field(default_factory=LLMConfig)
     accounts: list[AccountConfig] = field(default_factory=list)
+
+    @property
+    def raw_mail_dir(self) -> Path:
+        """agent 账号原始 MIME 的落盘目录（与数据库同级，崩溃恢复时不必重拉）。"""
+        return self.database_path.parent / "raw"
+
+    @property
+    def outbox_dir(self) -> Path:
+        """agent 回复生成的 .eml 文件目录，outbox.raw_path 指向这里。"""
+        return self.database_path.parent / "outbox"
+
+
+def _parse_str_list(raw: dict, key: str) -> list[str]:
+    """允许 YAML 列表或逗号分隔字符串；返回规范化、去重后的地址列表。"""
+    v = raw.get(key)
+    if v is None:
+        return []
+    items = v if isinstance(v, list) else str(v).split(",")
+    out: list[str] = []
+    for item in items:
+        addr = normalize_address(str(item))
+        if addr and addr not in out:
+            out.append(addr)
+    return out
 
 
 def _parse_account(raw: dict, index: int) -> AccountConfig:
@@ -222,10 +294,37 @@ def _parse_account(raw: dict, index: int) -> AccountConfig:
         daily_max_tokens=_get_int(raw, "daily_max_tokens", 1_000_000),
         on_processed=_get_str(raw, "on_processed", "mark_seen"),
         processed_folder=_get_str(raw, "processed_folder", "Processed"),
+        role=_get_str(raw, "role", "monitor").strip().lower(),
+        allowed_senders=_parse_str_list(raw, "allowed_senders"),
+        reply_display_name=_get_str(raw, "reply_display_name", "Leger"),
+        default_command=_get_str(raw, "default_command", "help").strip().lower().lstrip("#"),
+        max_command_attempts=_get_int(raw, "max_command_attempts", 3),
+        max_material_chars=_get_int(raw, "max_material_chars", 12000),
+        max_attachment_mb=_get_int(raw, "max_attachment_mb", 10),
+        max_mime_mb=_get_int(raw, "max_mime_mb", 25),
     )
-    missing = [f for f in ("name", "imap_host", "imap_user", "notification_to") if not getattr(cfg, f)]
+    if cfg.role not in ACCOUNT_ROLES:
+        raise ConfigError(f"accounts[{index}].role 只能是 {' 或 '.join(ACCOUNT_ROLES)}，得到: {cfg.role!r}")
+    required = ["name", "imap_host", "imap_user"]
+    if cfg.role == "monitor":
+        required.append("notification_to")   # agent 的回复只发给请求者，不需要通知邮箱
+    missing = [f for f in required if not getattr(cfg, f)]
     if missing:
         raise ConfigError(f"accounts[{index}] 缺少必填字段: {', '.join(missing)}")
+    if cfg.role == "agent":
+        if not cfg.allowed_senders:
+            raise ConfigError(f"accounts[{index}] 是 agent 角色，必须配置非空的 allowed_senders 白名单")
+        if not cfg.smtp_host:
+            raise ConfigError(f"accounts[{index}] 是 agent 角色，必须配置 smtp_host 才能回复命令")
+        overlap = cfg.self_addresses & set(cfg.allowed_senders)
+        if overlap:
+            raise ConfigError(
+                f"accounts[{index}].allowed_senders 不能包含本账号自己的地址（防止自环）: {', '.join(sorted(overlap))}")
+        if cfg.default_command not in AGENT_DEFAULT_COMMANDS:
+            raise ConfigError(
+                f"accounts[{index}].default_command 只能是 {' 或 '.join(AGENT_DEFAULT_COMMANDS)}，得到: {cfg.default_command!r}")
+        if cfg.max_command_attempts < 1:
+            raise ConfigError(f"accounts[{index}].max_command_attempts 必须 ≥ 1")
     if cfg.on_processed not in ("mark_seen", "move"):
         raise ConfigError(f"accounts[{index}].on_processed 只能是 mark_seen 或 move")
     try:

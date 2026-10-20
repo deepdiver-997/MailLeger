@@ -13,7 +13,8 @@ AI 邮件助手：通过 IMAP 定时扫描邮箱，先用规则、再用大模�
 - **崩溃恢复**：预写日志（write-ahead）语义，任何时刻崩溃可从 SQLite 续跑，不丢信、不重复发送。
 - **成本控制**：调用前按“字符数/4 + max_tokens”预估 token 并记账，每账号每日调用次数/token 双上限。
 - **每日汇总**：每天指定时间（如 21:00）合并当日低优先级邮件，可选用大模型生成摘要。
-- **安全**：通知邮件全部由代码模板生成，外部字段（含模型输出的“原因”）强制 HTML 转义 + 长度截断。
+- **安全**：通知邮件全部由代码模板生成，外部字段（含模型输出的"原因"）强制 HTML 转义 + 长度截断。
+- **命令邮箱（role: agent）**：托管一个专用账号，只响应白名单地址发来的 `#命令` 邮件，结果只回给发出命令的人；程序解析命令、不交给模型判断任务类型。详见[命令邮箱](#命令邮箱role-agent)。
 
 ## 架构说明
 
@@ -44,8 +45,10 @@ AI 邮件助手：通过 IMAP 定时扫描邮箱，先用规则、再用大模�
 | `src/db.py` | SQLite（WAL）建表与全部读写；预写日志/去重/队列/用量 |
 | `src/imap_worker.py` | IMAP 拉取（UID + PEEK）、正文提取（纯文本优先，HTML 剥标签） |
 | `src/classifier.py` | 规则预筛选 + 大模型分类/摘要（超时、重试、JSON 模式降级） |
-| `src/mailer.py` | 通知/汇总 HTML 模板（转义截断）+ SMTP 发送（SSL/STARTTLS） |
-| `src/engine.py` | 编排：扫描事务、决策链、配额、入队、发送、每日汇总 |
+| `src/mailer.py` | 通知/汇总 HTML 模板（转义截断）+ SMTP 发送（SSL/STARTTLS；`send_raw` 发送预生成 .eml） |
+| `src/commands.py` | agent：主题 `#命令` 解析、正文"指令/素材"切分、白名单鉴权、循环守卫（纯函数） |
+| `src/mime_builder.py` | agent：回复 .eml 构建（线程头 + 守卫头）、发送前不变量校验、help/status/说明渲染 |
+| `src/engine.py` | 编排：扫描事务、决策链、配额、入队、发送、每日汇总；agent 账号分流到命令处理 |
 | `src/scheduler.py` | `watch` 模式：轮询扫描 + 到点汇总 |
 | `src/cli.py` | 命令行入口与日志配置 |
 
@@ -56,7 +59,7 @@ AI 邮件助手：通过 IMAP 定时扫描邮箱，先用规则、再用大模�
 ```
 mailagent/
 ├── config/config.yaml      # 配置文件（init 自动生成，可手工编辑）
-├── data/                   # SQLite 数据库（mailagent.db），运行时生成
+├── data/                   # SQLite 数据库（mailagent.db）；agent 的 raw/（来信缓存）与 outbox/（待发 .eml）
 ├── logs/                   # mailagent.log（控制台 + 文件双输出）
 ├── src/
 │   ├── __init__.py
@@ -64,7 +67,9 @@ mailagent/
 │   ├── db.py
 │   ├── imap_worker.py
 │   ├── classifier.py
-│   ├── engine.py           # 编排层（新增）
+│   ├── commands.py         # agent 命令解析与鉴权
+│   ├── mime_builder.py     # agent 回复构建与校验
+│   ├── engine.py           # 编排层
 │   ├── mailer.py
 │   ├── scheduler.py
 │   └── cli.py
@@ -114,6 +119,31 @@ python3 -m src.cli watch               # 常驻运行（轮询 + 定时汇总）
 | `accounts[].daily_summary_time` | 每日汇总时间 `HH:MM` | 21:00 |
 | `accounts[].daily_max_calls` / `daily_max_tokens` | 每账号每日模型配额 | 500 / 1000000 |
 | `accounts[].on_processed` | 处理完成后 `mark_seen`（标已读）或 `move`（移入 `processed_folder`） | mark_seen |
+| `accounts[].role` | `monitor`（默认，上述行为）或 `agent`（命令邮箱，见下节） | monitor |
+| `accounts[].allowed_senders` | agent 必填：允许下命令的地址白名单（列表或逗号串，大小写不敏感，不得含本账号） | — |
+| `accounts[].reply_display_name` / `default_command` | agent 回复显示名；主题无 `#命令` 时的默认命令（`help` / `compose`） | Leger / help |
+| `accounts[].max_command_attempts` | agent 命令连续失败 N 次后回"处理失败"说明并终结 | 3 |
+| `accounts[].max_material_chars` / `max_attachment_mb` / `max_mime_mb` | agent 素材字符上限 / 单附件 MB / 生成邮件总 MB | 12000 / 10 / 25 |
+
+## 命令邮箱（role: agent）
+
+给 Leger 一个专用账号（如 `leger@example.com`）并设为 `role: agent`，它就成为一个**只听白名单指挥**的命令邮箱：
+
+- **命令写在主题里**：`#help`、`Fwd: #status`、`转发: #rewrite 改成正式语气`——允许 Re:/Fwd:/转发: 等前缀与 `[标签]`，取第一个 `#词`。手机上转发一封邮件只需改主题。
+- **正文第一条分隔线之上是指令，之下是素材**。识别 Gmail/Apple Mail/Outlook/QQ/网易等客户端的转发与引用标记；若把原邮件作为 `.eml` 附件转发，则以附件为素材、正文整体为指令。
+- **鉴权只看 From 是否在 `allowed_senders`**。非白名单来信静默丢弃：不回、不弹（避免 backscatter 与暴露命令面），只记一条 WARNING。这个 From 之所以可信，依赖邮件服务端拒绝"公网未认证会话携带本域发件人"——两边缺一不可。
+- **回复只发给发出命令的人**。写入 outbox 的收件人必须等于请求者且在白名单内，`send_outbox` 发送前再校验一次（收件人、无 Cc/Bcc、体积、守卫头），违反即永久失败并记 ERROR。这是"鉴权被绕过时最坏结果也只是你自己收到一封怪信"的保底。
+- **循环守卫**：`Auto-Submitted`、`X-Leger-Generated`、`Precedence: bulk/list`、邮件列表来信、来自本账号自身的邮件一律忽略；Leger 的所有回复都带 `Auto-Submitted: auto-replied` 与 `X-Leger-Generated: 1`，并用 `In-Reply-To`/`References` 挂在原线程里。
+
+| 命令 | 状态 | 说明 |
+| --- | --- | --- |
+| `#help` | 可用 | 命令列表与语法；未知命令、主题无命令时也回它 |
+| `#status` | 可用 | 今日模型用量/配额、待处理任务、发送队列、白名单（脱敏） |
+| `#compose [主题]` | 即将支持 | 按指令生成排版好的邮件（模型只产 JSON 规格，MIME 由代码生成） |
+| `#summarize` | 即将支持 | 总结分隔线下方或 .eml 附件中的素材 |
+| `#rewrite [要求]`（别名 `#forward`） | 即将支持 | 按要求改写转发来的邮件，默认保留原附件 |
+
+崩溃语义与 monitor 一致：来信原始 MIME 落盘到 `data/raw/<账号>/`（恢复时不重拉，完成后删除），回复 .eml 写到 `data/outbox/<账号>/` 并以 `dedup_key = cmd:{account}:{Message-ID}` 入队——崩溃重跑不会回两封。需要模型的命令失败会累计 `scan_tasks.attempts`，到 `max_command_attempts` 后回"处理失败"说明并终结，防止一个坏任务把每日配额烧光。
 
 ## 运行方式
 
@@ -194,7 +224,9 @@ systemctl daemon-reload && systemctl enable --now mailagent
 
 ## 数据库表
 
-`data/mailagent.db`（`PRAGMA journal_mode=WAL`）：`accounts`（配置快照）、`scan_tasks`（预写任务，pending/processed，含 priority/reason/raw_json）、`processed_messages`（Message-ID 去重）、`outbox`（发送队列，pending/sent/failed，dedup_key 唯一）、`api_usage`（预估/实际 token 账本）。
+`data/mailagent.db`（`PRAGMA journal_mode=WAL`）：`accounts`（配置快照）、`scan_tasks`（预写任务，pending/processed，含 priority/reason/raw_json/attempts）、`processed_messages`（Message-ID 去重）、`outbox`（发送队列，pending/sent/failed，dedup_key 唯一；`raw_path` 非空时发送预生成 .eml）、`api_usage`（预估/实际 token 账本）。
+
+> 旧库升级：启动时按 `PRAGMA table_info` 自动补 `scan_tasks.attempts`、`outbox.raw_path` 两列，幂等。
 
 > 命名说明：规格中的 `from` 列实现为 `from_addr`、`date` 为 `email_date`（避免 SQL 关键字歧义），并在 `scan_tasks` 上补充 `priority`/`reason` 两列便于汇总查询。
 

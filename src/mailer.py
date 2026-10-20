@@ -126,6 +126,12 @@ class SmtpSession:
         msg["To"] = to_addr
         self.smtp.sendmail(from_addr, [to_addr], msg.as_string())
 
+    def send_raw(self, from_addr: str, to_addr: str, raw: bytes) -> None:
+        """发送预生成的完整 .eml（agent 回复）。信封发件人用账号自身地址，服务端会强制一致。"""
+        if self.smtp is None:
+            raise RuntimeError("SMTP 会话未建立")
+        self.smtp.sendmail(from_addr, [to_addr], raw)
+
     def __exit__(self, exc_type, exc, tb) -> None:
         if self.smtp is not None:
             try:

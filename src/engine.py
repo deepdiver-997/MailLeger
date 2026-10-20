@@ -10,23 +10,38 @@
 5. 以上全部落库成功后，才把服务器邮件标记已读/移动到 Processed；
 6. 启动/每次扫描都会重新处理遗留 pending 任务（at-least-once），
    outbox 的 dedup_key 与 processed_messages 保证通知不重复发送。
+
+agent 账号（role: agent）在步骤 3 分流到 _process_command：鉴权 → 解析 #命令 → 执行 →
+回复只发给请求者（outbox 的 to_addr 必须在白名单内，send_outbox 再校验一次，违反即永久失败）。
 """
 from __future__ import annotations
 
+import email
+import email.policy
 import json
 import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
+from email.message import Message
+from pathlib import Path
 
+from . import __version__
 from .classifier import CLASSIFY_SYSTEM_PROMPT, LLMClassifier, LLMError, rule_classify
-from .config import AccountConfig, AppConfig
+from .commands import ParsedCommand, auto_mail_reason, command_catalog, is_authorized, parse_command_mail
+from .config import AccountConfig, AppConfig, normalize_address
 from .db import Database, now_str, today_str
 from .imap_worker import ImapClient, extract_text_body
 from .mailer import (SmtpSession, build_notification_html, build_summary_html,
                      extract_first_url, truncate)
+from .mime_builder import (build_reply, render_help, render_notice, render_status,
+                           reply_subject, validate_reply)
 
 logger = logging.getLogger(__name__)
+
+
+class DeadLetter(RuntimeError):
+    """outbox 条目违反不变量或文件丢失：永久失败，不再重试。"""
 
 
 @dataclass
@@ -51,7 +66,8 @@ class Engine:
         """对单个账号执行一次“扫描 + 处理 pending + 发送到期通知”。"""
         account_id = self.db.upsert_account(account)
         stats: dict[str, int] = {"new_tasks": 0, "notified": 0, "low": 0, "dedup": 0,
-                                 "too_long": 0, "quota": 0, "no_llm": 0, "retry_later": 0}
+                                 "too_long": 0, "quota": 0, "no_llm": 0, "retry_later": 0,
+                                 "command": 0, "unauthorized": 0, "ignored": 0}
         try:
             with ImapClient(account) as imap:
                 uids = imap.search_unseen()
@@ -110,6 +126,9 @@ class Engine:
             self.db.finish_task(task["id"], task["priority"] or "low", "去重：该邮件此前已处理")
             self._mark_processed_on_server(imap, account, task["email_uid"])
             return True, "dedup"
+
+        if account.role == "agent":
+            return self._process_command(account, account_id, task, imap, message_id)
 
         try:
             body = self._load_body(task, imap)
@@ -240,6 +259,154 @@ class Engine:
                 pass
 
     # ------------------------------------------------------------------
+    # agent 账号：命令处理
+    # ------------------------------------------------------------------
+    def _process_command(self, account: AccountConfig, account_id: int, task: sqlite3.Row,
+                         imap: ImapClient, message_id: str) -> tuple[bool, str]:
+        """鉴权 → 解析 → 执行 → 回复入队。回复的收件人永远是请求者本人。
+
+        失败语义与 monitor 一致：拉取失败保持 pending；执行失败计 attempts，
+        达到 max_command_attempts 后改回"处理失败"说明并终结，避免烧光配额。
+        """
+        try:
+            raw = self._load_raw(account, task, imap)
+        except Exception as e:
+            logger.warning("拉取命令邮件失败（保持 pending 待重试）：uid=%s，%s", task["email_uid"], e)
+            return False, ""
+        msg = email.message_from_bytes(raw, policy=email.policy.default)
+
+        reason = auto_mail_reason(msg, account)
+        if reason is not None:
+            self._finish_silently(account, account_id, task, imap, message_id, "ignored", f"忽略自动邮件：{reason}")
+            return True, "ignored"
+
+        from_addr = normalize_address(str(msg.get("From") or ""))
+        if not is_authorized(from_addr, account):
+            # 不回、不弹：避免 backscatter 与暴露命令面，只留日志
+            logger.warning("账号 %s 收到非白名单来信，静默丢弃：from=%s subject=%s",
+                           account.name, from_addr, (task["subject"] or "")[:80])
+            self._finish_silently(account, account_id, task, imap, message_id, "unauthorized",
+                                  f"非白名单发件人：{from_addr}")
+            return True, "unauthorized"
+
+        parsed = parse_command_mail(msg, extract_text_body(msg, self.cfg.max_extract_chars), account)
+        label = f"#{parsed.name or parsed.raw_name or '?'}"
+        try:
+            subject, html_body, text_body = self._run_command(account, account_id, parsed)
+            self._enqueue_command_reply(account, account_id, task, msg, parsed, from_addr,
+                                        subject, html_body, text_body, message_id)
+        except Exception as e:
+            attempts = self.db.increment_task_attempts(task["id"])
+            if attempts < account.max_command_attempts:
+                logger.warning("命令 %s 处理失败（第 %d 次，保持 pending）：%s", label, attempts, e)
+                return False, ""
+            logger.exception("命令 %s 连续失败 %d 次，回复错误说明并终结", label, attempts)
+            html_body, text_body = render_notice("处理失败", [
+                f"命令 {label} 连续 {attempts} 次处理失败，已停止重试。",
+                f"最后一次错误：{str(e)[:300]}",
+                "请稍后重新发送命令；若持续失败请查看 Leger 日志。",
+            ])
+            self._enqueue_command_reply(account, account_id, task, msg, parsed, from_addr,
+                                        reply_subject(parsed.clean_subject, parsed.raw_name),
+                                        html_body, text_body, message_id)
+
+        self.db.mark_message_processed(account_id, message_id)
+        self.db.finish_task(task["id"], "command", label)
+        self._mark_processed_on_server(imap, account, task["email_uid"])
+        self._drop_raw_cache(account, task)
+        return True, "command"
+
+    def _run_command(self, account: AccountConfig, account_id: int,
+                     parsed: ParsedCommand) -> tuple[str, str, str]:
+        """执行命令，返回 (回复主题, html, text)。需要大模型的命令在后续版本接入。"""
+        subject = reply_subject(parsed.clean_subject, parsed.raw_name)
+        spec = parsed.spec
+        if spec is None:
+            html_body, text_body = render_help(
+                account, command_catalog(), banner=f"未知命令 #{parsed.raw_name}，以下是可用命令。")
+            return subject, html_body, text_body
+        if not spec.enabled:
+            enabled = "、".join(f"#{c.name}" for c in command_catalog() if c.enabled)
+            html_body, text_body = render_notice("命令尚未启用", [
+                f"#{spec.name} 已识别，但当前版本还没有接入生成能力。",
+                f"目前可用：{enabled}。",
+            ])
+            return subject, html_body, text_body
+        if spec.name == "help":
+            banner = "主题里没有 #命令，已按默认命令处理。" if parsed.used_default else None
+            html_body, text_body = render_help(account, command_catalog(), banner=banner)
+            return subject, html_body, text_body
+        if spec.name == "status":
+            html_body, text_body = render_status(account, self._collect_status(account, account_id))
+            return subject, html_body, text_body
+        raise RuntimeError(f"命令 #{spec.name} 已启用但没有处理器")
+
+    def _collect_status(self, account: AccountConfig, account_id: int) -> dict:
+        calls, tokens = self.db.today_usage(account_id)
+        status = {
+            "calls_today": calls,
+            "tokens_today": tokens,
+            # 当前这条命令任务此刻仍是 pending，读到回复时它已完成，故不计入
+            "pending_tasks": max(0, self.db.count_pending_tasks(account_id) - 1),
+            "enabled_commands": [f"#{c.name}" for c in command_catalog() if c.enabled],
+            "version": __version__,
+        }
+        status.update(self.db.outbox_counts(account_id, self.cfg.max_send_retries))
+        return status
+
+    def _enqueue_command_reply(self, account: AccountConfig, account_id: int, task: sqlite3.Row,
+                               msg: Message, parsed: ParsedCommand, to_addr: str,
+                               subject: str, html_body: str, text_body: str, message_id: str) -> None:
+        """生成完整 .eml → 校验不变量 → 落盘 → 入 outbox（dedup_key 幂等）。"""
+        raw_reply = build_reply(
+            account=account, to_addr=to_addr, subject=subject,
+            html_body=html_body, text_body=text_body,
+            in_reply_to=str(msg.get("Message-ID") or "").strip(),
+            references=str(msg.get("References") or "").strip(),
+            command=parsed.name or parsed.raw_name or "",
+        )
+        validate_reply(raw_reply, to_addr, account.max_mime_mb * 1024 * 1024)
+        out_dir = self.cfg.outbox_dir / account.name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"task-{task['id']}.eml"
+        path.write_bytes(raw_reply)
+        self.db.enqueue_outbox(
+            account_id=account_id, task_id=task["id"], to_addr=to_addr,
+            subject=subject, body="", scheduled_time=now_str(),
+            dedup_key=f"cmd:{account_id}:{message_id}", raw_path=str(path),
+        )
+        logger.info("命令回复已入队：task=%s to=%s subject=%s", task["id"], to_addr, subject[:80])
+
+    def _finish_silently(self, account: AccountConfig, account_id: int, task: sqlite3.Row,
+                         imap: ImapClient, message_id: str, outcome: str, reason: str) -> None:
+        """不回复地终结任务（非白名单 / 自动邮件）。"""
+        self.db.mark_message_processed(account_id, message_id)
+        self.db.finish_task(task["id"], outcome, reason)
+        self._mark_processed_on_server(imap, account, task["email_uid"])
+        self._drop_raw_cache(account, task)
+
+    def _raw_cache_path(self, account: AccountConfig, task: sqlite3.Row) -> Path:
+        return self.cfg.raw_mail_dir / account.name / f"{task['email_uid']}.eml"
+
+    def _load_raw(self, account: AccountConfig, task: sqlite3.Row, imap: ImapClient) -> bytes:
+        """原始 MIME 落盘缓存：崩溃恢复时不重拉；写入用临时文件 + 原子替换。"""
+        path = self._raw_cache_path(account, task)
+        if path.is_file():
+            return path.read_bytes()
+        raw = imap.fetch_raw(task["email_uid"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".part")
+        tmp.write_bytes(raw)
+        tmp.replace(path)
+        return raw
+
+    def _drop_raw_cache(self, account: AccountConfig, task: sqlite3.Row) -> None:
+        try:
+            self._raw_cache_path(account, task).unlink()
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------
     # 发送
     # ------------------------------------------------------------------
     def send_outbox(self, account: AccountConfig) -> int:
@@ -252,11 +419,20 @@ class Engine:
         try:
             with SmtpSession(account) as smtp:
                 for row in rows:
+                    raw_path = row["raw_path"] if "raw_path" in row.keys() else None
                     try:
-                        smtp.send_html(row["to_addr"], row["subject"], row["body"])
+                        if raw_path:
+                            self._send_raw_row(smtp, account, row, raw_path)
+                        else:
+                            smtp.send_html(row["to_addr"], row["subject"], row["body"])
                         self.db.mark_outbox_sent(row["id"])
                         sent += 1
                         logger.info("邮件已发送：to=%s subject=%s", row["to_addr"], row["subject"][:80])
+                        if raw_path:
+                            Path(raw_path).unlink(missing_ok=True)   # 已落库 sent 之后才删文件
+                    except DeadLetter as e:
+                        self.db.mark_outbox_dead(row["id"], self.cfg.max_send_retries)
+                        logger.error("outbox #%s 永久失败（不再重试）：%s", row["id"], e)
                     except Exception as e:
                         self.db.mark_outbox_failed(row["id"])
                         logger.error("发送失败（将下次重试）：id=%s，%s", row["id"], e)
@@ -266,6 +442,23 @@ class Engine:
             logger.error("SMTP 连接失败，%d 封待发邮件延后重试：%s", len(rows), e)
         return sent
 
+    def _send_raw_row(self, smtp: SmtpSession, account: AccountConfig,
+                      row: sqlite3.Row, raw_path: str) -> None:
+        """发送预生成 .eml。agent 账号在这里再校验一次"只发给白名单"的不变量。"""
+        to_addr = normalize_address(row["to_addr"])
+        if account.role == "agent" and to_addr not in account.allowed_senders:
+            raise DeadLetter(f"收件人 {to_addr} 不在白名单内，拒绝发送")
+        path = Path(raw_path)
+        if not path.is_file():
+            raise DeadLetter(f"预生成邮件文件不存在：{raw_path}")
+        raw = path.read_bytes()
+        if account.role == "agent":
+            try:
+                validate_reply(raw, to_addr, account.max_mime_mb * 1024 * 1024)
+            except ValueError as e:
+                raise DeadLetter(str(e)) from e
+        smtp.send_raw(account.reply_from, to_addr, raw)
+
     # ------------------------------------------------------------------
     # 每日汇总
     # ------------------------------------------------------------------
@@ -274,6 +467,8 @@ class Engine:
 
         返回是否新生成（dedup_key = summary:{account_id}:{日期}，天然防重复）。
         """
+        if account.role == "agent":
+            return False   # 命令邮箱没有"低优先级邮件"概念，也没有通知收件箱
         account_id = self.db.upsert_account(account)
         today = today_str()
         dedup_key = f"summary:{account_id}:{today}"
