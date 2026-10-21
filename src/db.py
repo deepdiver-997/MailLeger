@@ -89,6 +89,24 @@ CREATE TABLE IF NOT EXISTS api_usage (
     task_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_api_usage_time ON api_usage (account_id, request_time);
+
+CREATE TABLE IF NOT EXISTS pending_sends (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    requester TEXT NOT NULL,
+    send_as TEXT NOT NULL,
+    to_addrs TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    code_hash TEXT NOT NULL,
+    raw_path TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'dead')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    sent_time TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pending_sends_lookup ON pending_sends (account_id, requester, status);
 """
 
 # 老库增量迁移：(表, 列, 列定义)。CREATE TABLE IF NOT EXISTS 不会给已存在的表补列。
@@ -363,6 +381,67 @@ class Database:
             (account_id,),
         ).fetchone()
         return int(row["calls"]), int(row["tokens"])
+
+    # ------------------------------------------------------------------
+    # pending_sends（#send-as 两步确认的待发邮件）
+    # ------------------------------------------------------------------
+    def create_pending_send(self, account_id: int, requester: str, send_as: str,
+                            to_addrs: str, subject: str, code_hash: str,
+                            raw_path: str, message_id: str, created_at: str,
+                            expires_at: str) -> int:
+        with self.conn:
+            cur = self.conn.execute(
+                """
+                INSERT INTO pending_sends
+                    (account_id, requester, send_as, to_addrs, subject, code_hash,
+                     raw_path, message_id, status, attempts, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+                """,
+                (account_id, requester, send_as, to_addrs, subject, code_hash,
+                 raw_path, message_id, created_at, expires_at),
+            )
+        return int(cur.lastrowid)
+
+    def find_pending_send(self, account_id: int, requester: str, code_hash: str) -> Optional[sqlite3.Row]:
+        """按确认码查待发任务；已过期/已发送/已作废的都不算命中。"""
+        return self.conn.execute(
+            """
+            SELECT * FROM pending_sends
+            WHERE account_id=? AND requester=? AND code_hash=?
+              AND status='pending' AND expires_at > ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (account_id, requester, code_hash, now_str()),
+        ).fetchone()
+
+    def latest_pending_send(self, account_id: int, requester: str) -> Optional[sqlite3.Row]:
+        """最近一个待确认任务（错误确认码时对它计次数、超限作废）。"""
+        return self.conn.execute(
+            """
+            SELECT * FROM pending_sends
+            WHERE account_id=? AND requester=? AND status='pending'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (account_id, requester),
+        ).fetchone()
+
+    def increment_pending_attempts(self, pending_id: int) -> int:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE pending_sends SET attempts=attempts+1 WHERE id=?", (pending_id,))
+        row = self.conn.execute("SELECT attempts FROM pending_sends WHERE id=?", (pending_id,)).fetchone()
+        return int(row["attempts"]) if row else 0
+
+    def dead_pending_send(self, pending_id: int) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE pending_sends SET status='dead' WHERE id=?", (pending_id,))
+
+    def mark_pending_sent(self, pending_id: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE pending_sends SET status='sent', sent_time=? WHERE id=?",
+                (now_str(), pending_id),
+            )
 
     # ------------------------------------------------------------------
     # 每日汇总查询

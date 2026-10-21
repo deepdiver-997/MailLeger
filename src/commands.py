@@ -50,6 +50,10 @@ COMMANDS: dict[str, CommandSpec] = {
         "rewrite", "#rewrite [要求]",
         "按要求改写转发来的邮件（语气/翻译/精简），默认保留全部原附件",
         needs_llm=True, aliases=("forward",)),
+    "confirm": CommandSpec(
+        "confirm", "#confirm 确认码",
+        "确认发送 Leger 生成的邮件（预览回信里会给出确认码，60 分钟内有效）",
+        aliases=("send",)),
 }
 
 _ALIAS_INDEX = {alias: spec.name for spec in COMMANDS.values() for alias in spec.aliases}

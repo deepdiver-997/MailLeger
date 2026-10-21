@@ -98,6 +98,9 @@ accounts:
     max_command_attempts: 3
     # 生成/总结/改写的输出语言偏好（如 简体中文），留空则跟随指令与素材
     # reply_language: 简体中文
+    # 可选：#compose/#rewrite 生成后支持"回复确认码即发送"。必须指向本配置中
+    # 另一个账号（Leger 持有其 SMTP 凭据）；留空 = 永远只出草稿不发送
+    # send_as: persona@example.com
     # 交给大模型的素材上限（字符）/ 单附件上限 / 生成邮件总体积上限（MB）
     max_material_chars: 12000
     max_attachment_mb: 10

@@ -2,6 +2,9 @@
 import os
 import tempfile
 import unittest
+from pathlib import Path
+
+import yaml
 
 from src import config as cfgmod
 from src.config import ConfigError
@@ -87,6 +90,28 @@ class TestAgentAccountConfig(unittest.TestCase):
         self.assertEqual(cfgmod._parse_account(dict(_AGENT_BASE), 0).reply_language, "")
         self.assertEqual(cfgmod._parse_account(dict(_AGENT_BASE, reply_language="简体中文"), 0).reply_language,
                          "简体中文")
+
+    def test_send_as_must_reference_configured_account(self) -> None:
+        """send_as 指向的账号必须在本配置里（凭据在本地才发得出去）。"""
+        raw = {"accounts": [{
+            "name": "leger", "role": "agent",
+            "imap_host": "imap.example.com", "imap_user": "leger@example.com",
+            "smtp_host": "smtp.example.com", "smtp_user": "leger@example.com",
+            "allowed_senders": ["you@example.com"], "send_as": "Boss <BOSS@example.com>",
+        }]}
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "config.yaml"
+            p.write_text(yaml.safe_dump(raw), encoding="utf-8")
+            with self.assertRaises(ConfigError):
+                cfgmod.load_config(p)
+            raw["accounts"].append({
+                "name": "boss", "imap_host": "imap.example.com", "imap_user": "boss@example.com",
+                "smtp_host": "smtp.example.com", "smtp_user": "boss@example.com",
+                "notification_to": "you@example.com"})
+            p.write_text(yaml.safe_dump(raw), encoding="utf-8")
+            cfg = cfgmod.load_config(p)
+            self.assertEqual(cfg.accounts[0].send_as, "boss@example.com")
+            self.assertEqual(cfg.accounts[1].sent_folder, "发件箱")
 
     def test_normalize_address(self) -> None:
         self.assertEqual(cfgmod.normalize_address('"Sakura" <SAKURA@Example.com>'), "sakura@example.com")

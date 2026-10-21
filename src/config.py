@@ -125,6 +125,7 @@ accounts:
   #   default_command: help          # 白名单来信但没带 #命令 时：help | compose
   #   max_command_attempts: 3        # 需要大模型的命令连续失败 N 次后回错误说明并终结
   #   reply_language: 简体中文        # 生成/总结/改写的输出语言偏好，留空跟随指令与素材
+  #   send_as: persona@example.com   # 可选：确认后以此配置内另一账号名义发送（两步确认码）
   #   on_processed: move
   #   processed_folder: Done
 """
@@ -235,6 +236,8 @@ class AccountConfig:
     max_attachment_mb: int = 10           # 单个附件上限
     max_mime_mb: int = 25                 # 生成邮件总体积上限
     reply_language: str = ""              # 生成/总结/改写的输出语言偏好，空 = 跟随指令与素材
+    send_as: str = ""                     # agent 专属：确认后以此账号名义发送（必须是配置里另一账号）
+    sent_folder: str = "发件箱"            # 发送成功后 APPEND 已发送副本的目标文件夹（空 = 不存副本）
 
     @property
     def self_addresses(self) -> set[str]:
@@ -317,6 +320,8 @@ def _parse_account(raw: dict, index: int) -> AccountConfig:
         max_attachment_mb=_get_int(raw, "max_attachment_mb", 10),
         max_mime_mb=_get_int(raw, "max_mime_mb", 25),
         reply_language=_get_str(raw, "reply_language", ""),
+        send_as=normalize_address(_get_str(raw, "send_as", "")),
+        sent_folder=_get_str(raw, "sent_folder", "发件箱"),
     )
     if cfg.role not in ACCOUNT_ROLES:
         raise ConfigError(f"accounts[{index}].role 只能是 {' 或 '.join(ACCOUNT_ROLES)}，得到: {cfg.role!r}")
@@ -389,6 +394,13 @@ def load_config(path: str | Path) -> AppConfig:
     if not isinstance(accounts_raw, list) or not accounts_raw:
         raise ConfigError("配置中至少需要一个 accounts 条目")
     accounts = [_parse_account(a, i) for i, a in enumerate(accounts_raw)]
+    # 跨账号校验：send_as 必须指向同一配置里另一个真实账号（凭据在本配置中才发得出去）
+    known = {normalize_address(a.imap_user) for a in accounts} | {normalize_address(a.smtp_user) for a in accounts if a.smtp_user}
+    for a in accounts:
+        if a.send_as and a.send_as not in known:
+            raise ConfigError(
+                f"accounts[{a.name}].send_as 指向 {a.send_as}，但它不是本配置中的账号"
+                "（发送凭据必须在本配置内）")
 
     cfg = AppConfig(
         config_path=cfg_path,

@@ -18,11 +18,16 @@ from __future__ import annotations
 
 import email
 import email.policy
+import hashlib
+import imaplib
 import json
 import logging
+import re
+import secrets
+import smtplib
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.message import Message
 from pathlib import Path
 from typing import Optional
@@ -45,6 +50,20 @@ logger = logging.getLogger(__name__)
 
 class DeadLetter(RuntimeError):
     """outbox 条目违反不变量或文件丢失：永久失败，不再重试。"""
+
+
+# 两步确认发送（#send-as）：确认码 / 有效期 / 错误次数上限
+CONFIRM_TTL_MIN = 60
+MAX_CONFIRM_ATTEMPTS = 3
+_CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"   # 去掉易混的 0/O/1/I/L
+
+
+def _confirm_code() -> str:
+    return "".join(secrets.choice(_CODE_ALPHABET) for _ in range(6))
+
+
+def _code_hash(requester: str, code: str) -> str:
+    return hashlib.sha256(f"{requester.lower()}:{code.upper()}".encode()).hexdigest()
 
 
 @dataclass
@@ -356,6 +375,8 @@ class Engine:
             return self._cmd_summarize(account, account_id, task, parsed)
         if spec.name == "rewrite":
             return self._cmd_rewrite(account, account_id, task, parsed, from_addr)
+        if spec.name == "confirm":
+            return self._cmd_confirm(account, account_id, task, parsed, from_addr)
         raise RuntimeError(f"命令 #{spec.name} 已启用但没有处理器")
 
     # ---- 需要模型的命令 -------------------------------------------------
@@ -381,6 +402,8 @@ class Engine:
             note += f" 草稿已带附件：{', '.join(n for n, _, _ in files)}。"
         if skipped:
             note += f" 未能带上的附件：{'; '.join(skipped)}。"
+        note += self._maybe_create_pending_send(account, account_id, parsed, spec,
+                                                html_body, text_body, files, from_addr)
         preview_html, preview_text = render_spec(spec, preface=note)
         return CommandReply(reply_subject(parsed.args or spec.subject, parsed.raw_name),
                             preview_html, preview_text, draft=("draft.eml", draft))
@@ -433,9 +456,139 @@ class Engine:
             note += f" 已保留附件：{', '.join(n for n, _, _ in files)}。"
         if skipped:
             note += f" 未能带上的附件：{'; '.join(skipped)}。"
+        note += self._maybe_create_pending_send(account, account_id, parsed, spec,
+                                                html_body, text_body, files, from_addr)
         preview_html, preview_text = render_spec(spec, preface=note)
         return CommandReply(reply_subject(parsed.args or spec.subject, parsed.raw_name),
                             preview_html, preview_text, draft=("draft.eml", draft))
+
+    # ---- 两步确认发送（#send-as / #confirm）---------------------------
+    def _resolve_send_account(self, account: AccountConfig) -> Optional[AccountConfig]:
+        """send_as 指向的账号配置——Leger 必须持有其 SMTP 凭据才发得出去。"""
+        if not account.send_as:
+            return None
+        for a in self.cfg.accounts:
+            if normalize_address(a.imap_user) == account.send_as or (
+                    a.smtp_user and normalize_address(a.smtp_user) == account.send_as):
+                return a
+        return None
+
+    def _maybe_create_pending_send(self, account: AccountConfig, account_id: int,
+                                   parsed: ParsedCommand, spec, html_body: str, text_body: str,
+                                   files: list, from_addr: str) -> str:
+        """compose/rewrite 成功且具备发送条件时，生成两步确认任务，返回追加到预览里的提示。
+
+        不适用（未配置 send_as / 规格无收件人）返回空串——那类结果仍只是草稿。
+        """
+        send_acc = self._resolve_send_account(account)
+        if send_acc is None or not send_acc.smtp_host or not spec.to:
+            return ""
+        code = _confirm_code()
+        now = datetime.now()
+        final_raw = build_draft_eml(
+            from_addr=send_acc.reply_from, to_addrs=spec.to, subject=spec.subject,
+            html_body=html_body, text_body=text_body, attachments=files,
+            draft_header=False)   # 对外成品：干净 MIME，无草稿标记
+        message_id = str(email.message_from_bytes(final_raw, policy=email.policy.default)
+                         .get("Message-ID") or "")
+        pending_dir = self.cfg.outbox_dir / account.name / "pending"
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        raw_path = pending_dir / f"pending-{secrets.token_hex(6)}.eml"
+        raw_path.write_bytes(final_raw)
+        self.db.create_pending_send(
+            account_id=account_id, requester=from_addr, send_as=send_acc.reply_from,
+            to_addrs=", ".join(spec.to), subject=spec.subject,
+            code_hash=_code_hash(from_addr, code), raw_path=str(raw_path),
+            message_id=message_id, created_at=now.strftime("%Y-%m-%d %H:%M:%S"),
+            expires_at=(now + timedelta(minutes=CONFIRM_TTL_MIN)).strftime("%Y-%m-%d %H:%M:%S"))
+        return (f"确认发送：回复 #confirm {code}，将以 {send_acc.reply_from} 名义真实发送给"
+                f" {', '.join(spec.to)}（{CONFIRM_TTL_MIN} 分钟内有效）。")
+
+    def _cmd_confirm(self, account: AccountConfig, account_id: int, task: sqlite3.Row,
+                     parsed: ParsedCommand, from_addr: str) -> CommandReply:
+        subject = "Re: 发送确认"
+        code = parsed.args.strip().upper()
+        if not re.fullmatch(r"[2-9A-Z]{4,10}", code or ""):
+            html_body, text_body = render_notice("用法：#confirm 确认码", [
+                "确认码在生成预览的回信里，例如：#confirm 7K2M4X。"])
+            return CommandReply(subject, html_body, text_body)
+
+        row = self.db.find_pending_send(account_id, from_addr, _code_hash(from_addr, code))
+        if row is None:
+            # 错误码/过期：对最近一个待发任务计错误次数，超限作废（防爆破）
+            latest = self.db.latest_pending_send(account_id, from_addr)
+            if latest is not None:
+                attempts = self.db.increment_pending_attempts(latest["id"])
+                if attempts >= MAX_CONFIRM_ATTEMPTS:
+                    self.db.dead_pending_send(latest["id"])
+                    Path(latest["raw_path"]).unlink(missing_ok=True)
+                    html_body, text_body = render_notice("发送任务已作废", [
+                        f"确认码连续错误 {attempts} 次，该任务已作废。",
+                        "请重新用 #compose / #rewrite 生成并确认。"])
+                    return CommandReply(subject, html_body, text_body)
+            html_body, text_body = render_notice("没有可确认的发送任务", [
+                "确认码不正确、已超过 60 分钟、已发送或已作废。",
+                "请回到原预览回信核对确认码。"])
+            return CommandReply(subject, html_body, text_body)
+
+        send_acc = self._resolve_send_account(account)
+        raw_path = Path(row["raw_path"])
+        if send_acc is None or not raw_path.is_file():
+            self.db.dead_pending_send(row["id"])
+            raw_path.unlink(missing_ok=True)
+            html_body, text_body = render_notice("发送任务已失效", [
+                "发送账号配置或待发文件不存在，请重新生成。"])
+            return CommandReply(subject, html_body, text_body)
+
+        raw = raw_path.read_bytes()
+        try:
+            with SmtpSession(send_acc) as smtp:
+                smtp.send_raw(send_acc.reply_from, row["to_addrs"], raw)
+        except smtplib.SMTPRecipientsRefused as e:
+            # 收件人被服务器拒收（如外部投递受限）：确定性失败，作废并说明
+            self.db.dead_pending_send(row["id"])
+            raw_path.unlink(missing_ok=True)
+            html_body, text_body = render_notice("发送被服务器拒绝", [
+                f"收件人 {row['to_addrs']} 被服务器拒收（外部投递受限时只能发本域）。",
+                str(e)[:300],
+            ])
+            return CommandReply(subject, html_body, text_body)
+        except (smtplib.SMTPException, OSError) as e:
+            logger.warning("确认发送临时失败（保留待发任务，可再次确认）：%s", e)
+            html_body, text_body = render_notice("发送暂时失败", [
+                "服务器暂时不可用，待发任务仍保留，请稍后重新回复确认码。", str(e)[:300]])
+            return CommandReply(subject, html_body, text_body)
+
+        self.db.mark_pending_sent(row["id"])
+        raw_path.unlink(missing_ok=True)
+        self._append_sent_copy(send_acc, raw)
+        html_body, text_body = render_notice("已发送", [
+            f"已以 {send_acc.reply_from} 名义发送给 {row['to_addrs']}。",
+            f"主题：{row['subject']}",
+        ])
+        return CommandReply(subject, html_body, text_body)
+
+    def _append_sent_copy(self, send_acc: AccountConfig, raw: bytes) -> None:
+        """已发送副本 APPEND 到发送账号的 Sent 文件夹；尽力而为，失败仅告警。"""
+        if not send_acc.sent_folder:
+            return
+        try:
+            if send_acc.imap_use_ssl:
+                conn = imaplib.IMAP4_SSL(send_acc.imap_host, send_acc.imap_port, timeout=20)
+            else:
+                conn = imaplib.IMAP4(send_acc.imap_host, send_acc.imap_port, timeout=20)
+            try:
+                conn.login(send_acc.imap_user, send_acc.imap_password)
+                quoted = '"' + send_acc.sent_folder.replace('"', '\\"') + '"'
+                conn.create(quoted)          # 已存在时服务器返回 NO，忽略
+                conn.append(quoted, "(\\Seen)", None, raw)
+            finally:
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning("已发送副本 APPEND 失败（不影响发送结果）：%s", e)
 
     def _generate_spec(self, account: AccountConfig, account_id: int, task: sqlite3.Row,
                        parsed: ParsedCommand, kind: str) -> tuple[Optional[MailSpec], Optional[CommandReply]]:

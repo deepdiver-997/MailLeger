@@ -77,8 +77,12 @@ def build_reply(*, account: AccountConfig, to_addr: str, subject: str,
 
 def build_draft_eml(*, from_addr: str, to_addrs: list[str], subject: str,
                     html_body: str, text_body: str,
-                    attachments: Iterable[tuple[str, str, bytes]] = ()) -> bytes:
-    """独立草稿：From 是请求者本人，To 来自规格（可为空）。Leger 不会发送它，只作为文件回给请求者。"""
+                    attachments: Iterable[tuple[str, str, bytes]] = (),
+                    draft_header: bool = True) -> bytes:
+    """独立草稿：From 是请求者本人，To 来自规格（可为空）。Leger 不会发送它，只作为文件回给请求者。
+
+    draft_header=False 时生成对外发送用的成品 MIME（不带 X-Leger-Draft 标记）。
+    """
     msg = EmailMessage(policy=SMTP)
     msg["From"] = from_addr
     if to_addrs:
@@ -87,7 +91,8 @@ def build_draft_eml(*, from_addr: str, to_addrs: list[str], subject: str,
     msg["Date"] = email.utils.formatdate(localtime=True)
     domain = from_addr.rsplit("@", 1)[-1] if "@" in from_addr else None
     msg["Message-ID"] = email.utils.make_msgid(domain=domain)
-    msg["X-Leger-Draft"] = "1"
+    if draft_header:
+        msg["X-Leger-Draft"] = "1"
     msg.set_content(text_body)
     msg.add_alternative(html_body, subtype="html")
     for filename, content_type, data in attachments:

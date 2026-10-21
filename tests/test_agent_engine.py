@@ -5,6 +5,7 @@
 import email
 import email.policy
 import json
+import re
 import tempfile
 import unittest
 from email.message import EmailMessage
@@ -337,6 +338,95 @@ class TestAgentEngine(unittest.TestCase):
         self.assertEqual(self.db.get_task(tid)["status"], "pending")
         self.assertEqual(self.db.get_task(tid)["attempts"], 1)
         self.assertEqual(self._outbox(), [])
+
+    # ---- 两步确认发送（#send-as / #confirm）-------------------------------
+    def _feedback(self) -> AccountConfig:
+        return AccountConfig(
+            name="feedback", imap_host="imap.example.com", imap_user="feedback@example.com",
+            smtp_host="smtp.example.com", smtp_user="feedback@example.com",
+            imap_password="pw", smtp_password="pw", sent_folder="")
+
+    def _enable_send(self) -> None:
+        self._enable_llm()
+        self.acc = _agent(send_as="feedback@example.com")
+        self.cfg.accounts.append(self._feedback())
+
+    def _pending_code(self) -> str:
+        html = self._reply_message(self._outbox()[0]).get_body(("html",)).get_content()
+        m = re.search(r"#confirm ([2-9A-Z]{6})", html)
+        self.assertIsNotNone(m, html)
+        return m.group(1)
+
+    def test_compose_with_send_as_creates_pending_and_confirm_sends(self) -> None:
+        self._enable_send()
+        with mock.patch.object(engine_module.Composer, "run", return_value=(_spec(), 7)):
+            self._run("40", _mail(REQUESTER, "#compose 通知", body="写给老板周报"),
+                      REQUESTER, "#compose 通知")
+        html = self._reply_message(self._outbox()[0]).get_body(("html",)).get_content()
+        self.assertIn("#confirm", html)
+        self.assertIn("feedback@example.com", html)
+        code = self._pending_code()
+        pending = self.db.latest_pending_send(self.account_id, REQUESTER)
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["to_addrs"], "boss@example.com")
+        raw = Path(pending["raw_path"]).read_bytes()
+        pmsg = email.message_from_bytes(raw, policy=email.policy.default)
+        # 对外成品是干净 MIME：无草稿标记、From 是发送账号、正文无预览说明
+        self.assertIsNone(pmsg["X-Leger-Draft"])
+        self.assertEqual(str(pmsg["From"]), "feedback@example.com")
+        self.assertIn("Leger 已按指令生成草稿", html)                 # 说明只在预览里
+        self.assertNotIn("生成草稿", pmsg.get_body(("plain",)).get_content())
+        self.assertNotIn("生成草稿", pmsg.get_body(("html",)).get_content())
+
+        with mock.patch.object(Engine, "_append_sent_copy") as append_copy:
+            _, outcome, _, _ = self._run(
+                "41", _mail(REQUESTER, f"#confirm {code}", message_id="<c41@example.com>"),
+                REQUESTER, f"#confirm {code}", mid="<c41@example.com>")
+        self.assertEqual(outcome, "command")
+        append_copy.assert_called_once()
+        self.assertEqual(_FakeSmtp.sent[-1][:3], ("raw", "feedback@example.com", "boss@example.com"))
+        sent_row = self.db.conn.execute(
+            "SELECT status FROM pending_sends WHERE id=?", (pending["id"],)).fetchone()
+        self.assertEqual(sent_row["status"], "sent")
+        self.assertFalse(Path(pending["raw_path"]).exists())
+        text = self._plain(self._outbox()[-1])
+        self.assertIn("已以 feedback@example.com 名义发送", text)
+
+    def test_confirm_wrong_code_three_times_dead(self) -> None:
+        self._enable_send()
+        with mock.patch.object(engine_module.Composer, "run", return_value=(_spec(), 1)):
+            self._run("42", _mail(REQUESTER, "#compose 通知", body="写"), REQUESTER, "#compose 通知")
+        pending = self.db.latest_pending_send(self.account_id, REQUESTER)
+        for i, wrong in enumerate(("ZZZZAQ", "ZZZZBQ", "ZZZZCQ")):
+            _, outcome, _, _ = self._run(
+                f"4{i}w", _mail(REQUESTER, f"#confirm {wrong}", message_id=f"<c42{i}@example.com>"),
+                REQUESTER, f"#confirm {wrong}", mid=f"<c42{i}@example.com>")
+            self.assertEqual(outcome, "command")
+        row = self.db.conn.execute(
+            "SELECT status, attempts FROM pending_sends WHERE id=?", (pending["id"],)).fetchone()
+        self.assertEqual(row["status"], "dead")
+        self.assertEqual(row["attempts"], 3)
+        self.assertEqual(_FakeSmtp.sent, [])                          # 从未真正发送
+        # 作废后连正确码也确认不了
+        code = self._pending_code()
+        self._run("45", _mail(REQUESTER, f"#confirm {code}", message_id="<c45@example.com>"),
+                  REQUESTER, f"#confirm {code}", mid="<c45@example.com>")
+        self.assertEqual(_FakeSmtp.sent, [])
+
+    def test_compose_without_send_as_or_recipient_no_pending(self) -> None:
+        self._enable_llm()
+        with mock.patch.object(engine_module.Composer, "run", return_value=(_spec(), 1)):
+            self._run("46", _mail(REQUESTER, "#compose 通知", body="写"), REQUESTER, "#compose 通知")
+        self.assertNotIn("#confirm", self._reply_message(self._outbox()[0]).get_body(("html",)).get_content())
+        self.assertIsNone(self.db.latest_pending_send(self.account_id, REQUESTER))
+
+        self._enable_send()
+        spec = parse_mail_spec({"template": "card", "subject": "s", "to": [],
+                                "blocks": [{"type": "paragraph", "text": "x"}], "attachments": []},
+                               SpecLimits(), available_attachments=0)
+        with mock.patch.object(engine_module.Composer, "run", return_value=(spec, 1)):
+            self._run("47", _mail(REQUESTER, "#compose 通知", body="写"), REQUESTER, "#compose 通知")
+        self.assertIsNone(self.db.latest_pending_send(self.account_id, REQUESTER))   # 无收件人不建任务
 
     # ---- #rewrite -------------------------------------------------------
     def test_rewrite_requires_instruction(self) -> None:
