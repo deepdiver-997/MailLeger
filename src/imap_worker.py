@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import base64
 import email
 import email.policy
 import email.utils
@@ -157,6 +158,31 @@ def _meta_from_message(uid: str, resp_line: bytes, msg: Message) -> MailMeta:
     )
 
 
+def imap_utf7_encode(name: str) -> str:
+    """RFC 3501 §5.1.3 modified UTF-7：中文等非 ASCII 文件夹名必须转码后才能放进
+    IMAP 命令（imaplib 用 ASCII 发命令行，'发件箱' 直接传会 UnicodeEncodeError）。
+    已对 scut.email 线上验证：enc('发件箱') == '&U9FO9nux-'（与 LIST 输出一致）。"""
+    out: list[str] = []
+    buf: list[str] = []
+    for ch in name:
+        if 0x20 <= ord(ch) <= 0x7E:
+            if buf:
+                out.append(_utf7_b64(buf))
+                buf = []
+            out.append("&-" if ch == "&" else ch)
+        else:
+            buf.append(ch)
+    if buf:
+        out.append(_utf7_b64(buf))
+    return "".join(out)
+
+
+def _utf7_b64(chars: list[str]) -> str:
+    raw = "".join(chars).encode("utf-16-be")
+    b64 = base64.b64encode(raw).decode("ascii").rstrip("=").replace("/", ",")
+    return "&" + b64 + "-"
+
+
 class ImapClient:
     """单个账号的 IMAP 会话，配合 with 使用；所有命令基于 UID。"""
 
@@ -264,7 +290,7 @@ class ImapClient:
     def move_to_folder(self, uid: str, folder: str) -> None:
         """复制到目标文件夹后删除原邮件；目标文件夹不存在则尝试创建。"""
         assert self.conn is not None
-        quoted = '"' + folder.replace('"', '\\"') + '"'
+        quoted = '"' + imap_utf7_encode(folder).replace('"', '\\"') + '"'
         self.conn.create(quoted)  # 已存在时服务器返回 NO，忽略结果
         typ, data = self.conn.uid("COPY", uid, quoted)
         if typ != "OK":

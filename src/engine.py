@@ -26,6 +26,7 @@ import re
 import secrets
 import smtplib
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from email.message import Message
@@ -39,7 +40,7 @@ from .commands import (ParsedCommand, auto_mail_reason, command_catalog, is_auth
 from .composer import AttachmentInfo, Composer, MailSpec
 from .config import AccountConfig, AppConfig, normalize_address
 from .db import Database, now_str, today_str
-from .imap_worker import ImapClient, extract_text_body
+from .imap_worker import ImapClient, extract_text_body, imap_utf7_encode
 from .mailer import (SmtpSession, build_notification_html, build_summary_html,
                      extract_first_url, truncate)
 from .mime_builder import (build_draft_eml, build_reply, render_help, render_notice, render_spec,
@@ -569,26 +570,34 @@ class Engine:
         return CommandReply(subject, html_body, text_body)
 
     def _append_sent_copy(self, send_acc: AccountConfig, raw: bytes) -> None:
-        """已发送副本 APPEND 到发送账号的 Sent 文件夹；尽力而为，失败仅告警。"""
+        """已发送副本 APPEND 到发送账号的 Sent 文件夹；尽力而为，失败仅告警。
+
+        在后台线程执行：线上服务端存在"APPEND 成功后同会话命令被吞"的已知问题
+        （登录后只 APPEND 时，QUIT 响应也会被吞），同步等待会平白拖住确认回执。
+        """
         if not send_acc.sent_folder:
             return
-        try:
-            if send_acc.imap_use_ssl:
-                conn = imaplib.IMAP4_SSL(send_acc.imap_host, send_acc.imap_port, timeout=20)
-            else:
-                conn = imaplib.IMAP4(send_acc.imap_host, send_acc.imap_port, timeout=20)
+
+        def _run() -> None:
             try:
-                conn.login(send_acc.imap_user, send_acc.imap_password)
-                quoted = '"' + send_acc.sent_folder.replace('"', '\\"') + '"'
-                conn.create(quoted)          # 已存在时服务器返回 NO，忽略
-                conn.append(quoted, "(\\Seen)", None, raw)
-            finally:
+                if send_acc.imap_use_ssl:
+                    conn = imaplib.IMAP4_SSL(send_acc.imap_host, send_acc.imap_port, timeout=15)
+                else:
+                    conn = imaplib.IMAP4(send_acc.imap_host, send_acc.imap_port, timeout=15)
                 try:
-                    conn.logout()
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.warning("已发送副本 APPEND 失败（不影响发送结果）：%s", e)
+                    conn.login(send_acc.imap_user, send_acc.imap_password)
+                    quoted = '"' + imap_utf7_encode(send_acc.sent_folder).replace('"', '\\"') + '"'
+                    conn.create(quoted)      # 已存在时服务器返回 NO，忽略
+                    conn.append(quoted, "(\\Seen)", None, raw)
+                finally:
+                    try:
+                        conn.logout()
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning("已发送副本 APPEND 失败（不影响发送结果）：%s", e)
+
+        threading.Thread(target=_run, name="leger-sent-copy", daemon=True).start()
 
     def _generate_spec(self, account: AccountConfig, account_id: int, task: sqlite3.Row,
                        parsed: ParsedCommand, kind: str) -> tuple[Optional[MailSpec], Optional[CommandReply]]:
