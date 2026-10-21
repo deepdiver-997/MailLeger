@@ -48,8 +48,8 @@ COMMANDS: dict[str, CommandSpec] = {
         needs_llm=True),
     "rewrite": CommandSpec(
         "rewrite", "#rewrite [要求]",
-        "按要求改写转发来的邮件，默认保留原附件",
-        enabled=False, needs_llm=True, aliases=("forward",)),
+        "按要求改写转发来的邮件（语气/翻译/精简），默认保留全部原附件",
+        needs_llm=True, aliases=("forward",)),
 }
 
 _ALIAS_INDEX = {alias: spec.name for spec in COMMANDS.values() for alias in spec.aliases}

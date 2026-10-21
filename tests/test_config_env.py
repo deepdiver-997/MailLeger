@@ -83,6 +83,11 @@ class TestAgentAccountConfig(unittest.TestCase):
         self.assertEqual(acc.role, "monitor")
         self.assertEqual(acc.allowed_senders, [])
 
+    def test_reply_language_optional(self) -> None:
+        self.assertEqual(cfgmod._parse_account(dict(_AGENT_BASE), 0).reply_language, "")
+        self.assertEqual(cfgmod._parse_account(dict(_AGENT_BASE, reply_language="简体中文"), 0).reply_language,
+                         "简体中文")
+
     def test_normalize_address(self) -> None:
         self.assertEqual(cfgmod.normalize_address('"Sakura" <SAKURA@Example.com>'), "sakura@example.com")
         self.assertEqual(cfgmod.normalize_address("  plain@x.y "), "plain@x.y")

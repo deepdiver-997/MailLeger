@@ -7,8 +7,8 @@ import email
 import email.policy
 import unittest
 
-from src.composer import (AttachmentInfo, ComposeError, Composer, SpecError, SpecLimits,
-                          loads_model_json, parse_mail_spec)
+from src.composer import (REWRITE_SYSTEM_PROMPT, AttachmentInfo, ComposeError, Composer,
+                          SpecError, SpecLimits, loads_model_json, parse_mail_spec)
 from src.config import LLMConfig
 from src.mime_builder import build_draft_eml, inline_html, inline_text, render_spec
 
@@ -99,6 +99,17 @@ class TestComposer(unittest.TestCase):
                         generate_max_tokens=1234, generate_timeout_seconds=77)
         client = _FakeClient(outputs)
         return Composer(llm, client), client
+
+    def test_prepare_rewrite_uses_rewrite_prompt_and_language_hint(self) -> None:
+        composer, _ = self._composer([])
+        req = composer.prepare("rewrite", "翻译成英文并更正式", "", "原文素材",
+                               [AttachmentInfo(0, "a.txt", "text/plain", 5)], language_hint="简体中文")
+        self.assertEqual(req.messages[0]["content"], REWRITE_SYSTEM_PROMPT)
+        user = req.messages[1]["content"]
+        self.assertIn("改写要求：\n翻译成英文并更正式", user)
+        self.assertIn("输出语言：简体中文", user)
+        self.assertIn("[0] a.txt (text/plain", user)
+        self.assertIn("<<<MATERIAL\n原文素材\nMATERIAL>>>", user)
 
     def test_prepare_and_estimate(self) -> None:
         composer, _ = self._composer([])

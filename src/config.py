@@ -124,6 +124,7 @@ accounts:
   #   reply_display_name: Leger
   #   default_command: help          # 白名单来信但没带 #命令 时：help | compose
   #   max_command_attempts: 3        # 需要大模型的命令连续失败 N 次后回错误说明并终结
+  #   reply_language: 简体中文        # 生成/总结/改写的输出语言偏好，留空跟随指令与素材
   #   on_processed: move
   #   processed_folder: Done
 """
@@ -233,6 +234,7 @@ class AccountConfig:
     max_material_chars: int = 12000       # 交给大模型的素材上限（字符）
     max_attachment_mb: int = 10           # 单个附件上限
     max_mime_mb: int = 25                 # 生成邮件总体积上限
+    reply_language: str = ""              # 生成/总结/改写的输出语言偏好，空 = 跟随指令与素材
 
     @property
     def self_addresses(self) -> set[str]:
@@ -314,6 +316,7 @@ def _parse_account(raw: dict, index: int) -> AccountConfig:
         max_material_chars=_get_int(raw, "max_material_chars", 12000),
         max_attachment_mb=_get_int(raw, "max_attachment_mb", 10),
         max_mime_mb=_get_int(raw, "max_mime_mb", 25),
+        reply_language=_get_str(raw, "reply_language", ""),
     )
     if cfg.role not in ACCOUNT_ROLES:
         raise ConfigError(f"accounts[{index}].role 只能是 {' 或 '.join(ACCOUNT_ROLES)}，得到: {cfg.role!r}")

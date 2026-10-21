@@ -180,11 +180,12 @@ class TestAgentEngine(unittest.TestCase):
         html = self._reply_message(self._outbox()[0]).get_body(("html",)).get_content()
         self.assertIn("未知命令 #foobar", html)
 
-    def test_disabled_command_gets_notice(self) -> None:
-        self._run("5", _mail(REQUESTER, "#rewrite 改写"), REQUESTER, "#rewrite 改写")
-        reply = self._reply_message(self._outbox()[0])
-        self.assertEqual(str(reply["Subject"]), "Re: 改写")
-        self.assertIn("尚未启用", reply.get_body(("plain",)).get_content())
+    def test_rewrite_requires_material(self) -> None:
+        self._enable_llm()
+        with mock.patch.object(engine_module.Composer, "run") as run:
+            self._run("5", _mail(REQUESTER, "#rewrite 改成英文", body="改成英文"), REQUESTER, "#rewrite 改成英文")
+        run.assert_not_called()
+        self.assertIn("需要素材", self._plain(self._outbox()[0]))
 
     def test_status_reply_masks_whitelist(self) -> None:
         self._run("6", _mail(REQUESTER, "#status"), REQUESTER, "#status")
@@ -336,6 +337,42 @@ class TestAgentEngine(unittest.TestCase):
         self.assertEqual(self.db.get_task(tid)["status"], "pending")
         self.assertEqual(self.db.get_task(tid)["attempts"], 1)
         self.assertEqual(self._outbox(), [])
+
+    # ---- #rewrite -------------------------------------------------------
+    def test_rewrite_requires_instruction(self) -> None:
+        # 有素材但没说要怎么改：不做默认改写，避免悄悄丢信息
+        self._enable_llm()
+        body = "\n---------- Forwarded message ---------\nFrom: a@b.c\n\n很长的原文"
+        with mock.patch.object(engine_module.Composer, "run") as run:
+            self._run("31", _mail(REQUESTER, "#rewrite", body=body), REQUESTER, "#rewrite")
+        run.assert_not_called()
+        self.assertIn("需要改写要求", self._plain(self._outbox()[0]))
+
+    def test_rewrite_keeps_all_attachments_by_default(self) -> None:
+        self._enable_llm()
+        m = EmailMessage()
+        m["From"], m["To"], m["Subject"], m["Message-ID"] = REQUESTER, "leger@example.com", "#rewrite 精简", "<m30@example.com>"
+        m.set_content("压到一半\n---------- Forwarded message ---------\nFrom: a@b.c\n\n很长的原文")
+        m.add_attachment(b"CSV,data", maintype="text", subtype="csv", filename="data.csv")
+        spec = parse_mail_spec(
+            {"template": "plain", "subject": "季度报告（精简）", "to": [],
+             "blocks": [{"type": "paragraph", "text": "精简后的正文。"}], "attachments": []},
+            SpecLimits(), available_attachments=1)
+        with mock.patch.object(engine_module.Composer, "run", return_value=(spec, 42)) as run:
+            self._run("30", m.as_bytes(), REQUESTER, "#rewrite 精简", mid="<m30@example.com>")
+        req = run.call_args.args[0]
+        self.assertEqual(req.kind, "rewrite")
+        user_prompt = req.messages[1]["content"]
+        self.assertIn("改写要求：\n压到一半", user_prompt)
+        self.assertIn("很长的原文", user_prompt)                      # 分隔线下方作为素材
+        self.assertIn("[0] data.csv (text/csv", user_prompt)
+        reply = self._reply_message(self._outbox()[0])
+        self.assertEqual(str(reply["Subject"]), "Re: 精简")
+        draft = list(reply.iter_attachments())[0].get_content()
+        inner = list(draft.iter_attachments())
+        self.assertEqual([a.get_filename() for a in inner], ["data.csv"])   # 默认保留全部原附件
+        self.assertEqual(str(draft["Subject"]), "季度报告（精简）")
+        self.assertIn("已保留附件：data.csv", self._plain(self._outbox()[0]))
 
     # ------------------------------------------------------------------
     def test_send_outbox_sends_raw_then_unlinks_file(self) -> None:

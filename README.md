@@ -126,6 +126,7 @@ python3 -m src.cli watch               # 常驻运行（轮询 + 定时汇总）
 | `accounts[].reply_display_name` / `default_command` | agent 回复显示名；主题无 `#命令` 时的默认命令（`help` / `compose`） | Leger / help |
 | `accounts[].max_command_attempts` | agent 命令连续失败 N 次后回"处理失败"说明并终结 | 3 |
 | `accounts[].max_material_chars` / `max_attachment_mb` / `max_mime_mb` | agent 素材字符上限 / 单附件 MB / 生成邮件总 MB | 12000 / 10 / 25 |
+| `accounts[].reply_language` | 生成/总结/改写的输出语言偏好（如 `简体中文`），空 = 跟随指令与素材 | — |
 
 ## 命令邮箱（role: agent）
 
@@ -143,7 +144,7 @@ python3 -m src.cli watch               # 常驻运行（轮询 + 定时汇总）
 | `#status` | 可用 | 今日模型用量/配额、待处理任务、发送队列、白名单（脱敏） |
 | `#compose [主题]` | 可用 | 按正文指令生成排版好的邮件：回信正文即预览（可直接转发），附 `draft.eml`（From 是你、To 来自指令），可带上命令邮件里的附件 |
 | `#summarize` | 可用 | 对分隔线下方或 .eml 附件中的素材做结构化总结（概述 / 要点 / 时间节点 / 待决事项） |
-| `#rewrite [要求]`（别名 `#forward`） | 即将支持 | 按要求改写转发来的邮件，默认保留原附件 |
+| `#rewrite [要求]`（别名 `#forward`） | 可用 | 按要求改写转发来的邮件（语气 / 翻译 / 精简）：忠实性约束——不得增删素材里的事实，主题默认沿用原邮件；**默认保留全部原附件**（模型没选就全带，超限的跳过并说明）；必须写明改写要求，不做无指令的默认改写 |
 
 **生成类命令的边界**：模型只产出一个 JSON 规格（`MailSpec`：模板、主题、收件人、内容块、附件索引），经 `composer.py` 严格校验（块类型、长度、数量、链接只允许 `http(s)`/`mailto`、收件人格式、附件索引），不合法时带错误反馈重试一次；MIME 由 `mime_builder.py` 的确定性代码渲染（表格布局 + 内联 CSS，四套模板 `card`/`report`/`notice`/`plain`），所有字段转义。素材用 `<<<MATERIAL … MATERIAL>>>` 包裹并在提示词里声明为数据。生成调用走与分类相同的配额账本（`api_usage`），模型与 token 预算单独配置（`llm.generate_*`）。
 

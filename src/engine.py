@@ -354,6 +354,8 @@ class Engine:
             return self._cmd_compose(account, account_id, task, parsed, from_addr)
         if spec.name == "summarize":
             return self._cmd_summarize(account, account_id, task, parsed)
+        if spec.name == "rewrite":
+            return self._cmd_rewrite(account, account_id, task, parsed, from_addr)
         raise RuntimeError(f"命令 #{spec.name} 已启用但没有处理器")
 
     # ---- 需要模型的命令 -------------------------------------------------
@@ -399,6 +401,42 @@ class Engine:
         return CommandReply(reply_subject(parsed.clean_subject or spec.subject, parsed.raw_name),
                             html_body, text_body)
 
+    def _cmd_rewrite(self, account: AccountConfig, account_id: int, task: sqlite3.Row,
+                     parsed: ParsedCommand, from_addr: str) -> CommandReply:
+        """改写转发来的邮件：默认沿用原主题、保留全部原附件。"""
+        subject = reply_subject(parsed.clean_subject, parsed.raw_name)
+        if not parsed.has_material:
+            html_body, text_body = render_notice("#rewrite 需要素材", [
+                "请把要改写的邮件放在正文分隔线下方（直接转发即可），或把原邮件作为 .eml 附件转发。",
+                "分隔线之上写改写要求，例如：翻译成英文并更正式 / 压缩到一半篇幅 / 语气改成对客户友好。",
+            ])
+            return CommandReply(subject, html_body, text_body)
+        if not parsed.instruction.strip() and not parsed.args.strip():
+            html_body, text_body = render_notice("#rewrite 需要改写要求", [
+                "请在正文分隔线之上写明要怎么改（例如：翻译成英文并更正式 / 压缩到一半篇幅）。",
+                "什么都不写就改写容易丢信息，所以这一步不做默认。",
+            ])
+            return CommandReply(subject, html_body, text_body)
+        spec, blocked = self._generate_spec(account, account_id, task, parsed, "rewrite")
+        if blocked is not None:
+            return blocked
+        assert spec is not None
+        if not spec.attachments and parsed.attachments:
+            spec.attachments = list(range(len(parsed.attachments)))   # 改写默认保留全部原附件
+        html_body, text_body = render_spec(spec)
+        files, skipped = self._resolve_attachments(account, parsed, spec)
+        draft = build_draft_eml(from_addr=from_addr, to_addrs=spec.to, subject=spec.subject,
+                                html_body=html_body, text_body=text_body, attachments=files)
+        note = (f"Leger 已按要求改写（主题：{spec.subject}）。下方即改写后的邮件正文，可直接转发；"
+                f"附件 draft.eml 可另存，收件人：{', '.join(spec.to) or '未指定'}。")
+        if files:
+            note += f" 已保留附件：{', '.join(n for n, _, _ in files)}。"
+        if skipped:
+            note += f" 未能带上的附件：{'; '.join(skipped)}。"
+        preview_html, preview_text = render_spec(spec, preface=note)
+        return CommandReply(reply_subject(parsed.args or spec.subject, parsed.raw_name),
+                            preview_html, preview_text, draft=("draft.eml", draft))
+
     def _generate_spec(self, account: AccountConfig, account_id: int, task: sqlite3.Row,
                        parsed: ParsedCommand, kind: str) -> tuple[Optional[MailSpec], Optional[CommandReply]]:
         """配额/密钥门禁 → 预留记账 → 生成 → 回填。门禁未过返回说明回复（确定性结果，不计 attempts）。"""
@@ -408,7 +446,8 @@ class Engine:
             return None, CommandReply(subject, html_body, text_body)
         material = material_text_for_llm(parsed, account.max_material_chars)
         infos = [AttachmentInfo(a.index, a.filename, a.content_type, a.size) for a in parsed.attachments]
-        req = self.composer.prepare(kind, parsed.instruction, parsed.args, material, infos)
+        req = self.composer.prepare(kind, parsed.instruction, parsed.args, material, infos,
+                                    language_hint=account.reply_language)
         estimated = self.composer.estimate_tokens(req)
         ok, quota_msg = self._quota_ok(account, account_id, estimated)
         if not ok:

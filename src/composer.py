@@ -274,19 +274,50 @@ SUMMARIZE_SYSTEM_PROMPT = (
     "约束：template 固定为 report；to 与 attachments 为空数组；blocks 1~40 个；每段文字不超过 2000 字。"
 )
 
+REWRITE_SYSTEM_PROMPT = (
+    "你是邮件助手 Leger 的改写模块。用户会给你一封已有邮件（素材）和改写要求，"
+    "请按要求改写这封邮件（例如调整语气、精简、翻译、重排结构、补全称呼与结尾），"
+    "并且只能输出一个符合下述结构的 JSON 对象（MailSpec），不要输出任何其他文字。\n"
+    + _SAFETY + "\n"
+    "忠实性规则：只使用素材中存在的事实，时间、人名、金额、链接等不得增删或改变含义；"
+    "改写要求里没提到的内容保持原样；subject 默认沿用素材主题，除非指令要求修改；"
+    "正文要是一封完整可发送的邮件（按素材与指令决定是否需要称呼与结尾）。\n"
+    "结构：" + SPEC_SCHEMA + "\n"
+    "约束：blocks 1~40 个；每段文字不超过 2000 字；to 仅当指令明确给出收件人时填写；"
+    "attachments 留空即表示沿用素材的全部附件（由系统自动带上）。"
+)
+
+_SYSTEM_PROMPTS = {
+    "compose": COMPOSE_SYSTEM_PROMPT,
+    "summarize": SUMMARIZE_SYSTEM_PROMPT,
+    "rewrite": REWRITE_SYSTEM_PROMPT,
+}
+
+_INSTRUCTION_LABELS = {
+    "compose": "指令",
+    "rewrite": "改写要求",
+    "summarize": "指令（总结侧重点，可为空）",
+}
+
 
 def build_user_prompt(kind: str, instruction: str, args: str, material: str,
-                      attachments: list[AttachmentInfo]) -> str:
+                      attachments: list[AttachmentInfo], language_hint: str = "") -> str:
     parts: list[str] = []
+    label = _INSTRUCTION_LABELS.get(kind, "指令")
     if kind == "compose":
-        parts.append("指令：\n" + (instruction.strip() or "（无，按主题参数撰写）"))
-        if args.strip():
-            parts.append("主题参数：" + args.strip())
+        default_instruction = "（无，按主题参数撰写）"
+    elif kind == "summarize":
+        default_instruction = "（无）"
     else:
-        parts.append("指令（总结侧重点，可为空）：\n" + (instruction.strip() or "（无）"))
+        default_instruction = "（无，仅做忠实润色）"
+    parts.append(f"{label}：\n" + (instruction.strip() or default_instruction))
+    if args.strip():
+        parts.append("主题参数：" + args.strip())
     listing = "\n".join(a.describe() for a in attachments) or "（无）"
     parts.append("可用附件：\n" + listing)
     parts.append("素材：\n<<<MATERIAL\n" + (material.strip() or "（无）") + "\nMATERIAL>>>")
+    if language_hint.strip():
+        parts.append("输出语言：" + language_hint.strip())
     return "\n\n".join(parts)
 
 
@@ -310,9 +341,9 @@ class Composer:
         self.limits = limits or SpecLimits()
 
     def prepare(self, kind: str, instruction: str, args: str, material: str,
-                attachments: list[AttachmentInfo]) -> ComposeRequest:
-        system = COMPOSE_SYSTEM_PROMPT if kind == "compose" else SUMMARIZE_SYSTEM_PROMPT
-        user = build_user_prompt(kind, instruction, args, material, attachments)
+                attachments: list[AttachmentInfo], language_hint: str = "") -> ComposeRequest:
+        system = _SYSTEM_PROMPTS.get(kind) or COMPOSE_SYSTEM_PROMPT
+        user = build_user_prompt(kind, instruction, args, material, attachments, language_hint)
         return ComposeRequest(
             kind=kind,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
