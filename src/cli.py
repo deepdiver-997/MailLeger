@@ -19,6 +19,7 @@ from pathlib import Path
 from .config import AppConfig, ConfigError, init_config_file, load_config
 from .db import Database
 from .engine import Engine
+from .retention import run_retention
 
 logger = logging.getLogger("mailagent")
 
@@ -34,6 +35,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("scan", parents=[common], help="执行一次扫描，处理所有账号的 pending 任务并发送到期通知")
     sub.add_parser("summary", parents=[common], help="立即生成并发送当日汇总")
     sub.add_parser("watch", parents=[common], help="持续运行：轮询扫描 + 定时汇总")
+    clean = sub.add_parser("clean", parents=[common],
+                           help="立即执行一次保留期清理（retention_days>0 的账号）")
+    clean.add_argument("--dry-run", action="store_true",
+                       help="只统计将被删除的邮件数，不实际删除")
     return parser
 
 
@@ -105,6 +110,26 @@ def cmd_summary(cfg: AppConfig, engine: Engine) -> int:
     return 0
 
 
+def cmd_clean(cfg: AppConfig, args: argparse.Namespace) -> int:
+    """手动触发保留期清理（clean 子命令）。"""
+    ran = False
+    for account in cfg.accounts:
+        if account.retention_days <= 0:
+            continue
+        ran = True
+        try:
+            stats = run_retention(account, dry_run=args.dry_run)
+            readable = ", ".join(f"{k}={v}" for k, v in stats.items())
+            print(f"账号 {account.name}（保留 {account.retention_days} 天）："
+                  + (readable or "没有超龄邮件"))
+        except Exception:
+            logger.exception("账号 %s 保留期清理失败", account.name)
+            print(f"  账号 {account.name} 清理失败，详见日志")
+    if not ran:
+        print("没有任何账号启用 retention_days（>0），无事可做")
+    return 0
+
+
 def cmd_watch(cfg: AppConfig, engine: Engine) -> int:
     import signal
 
@@ -139,6 +164,8 @@ def main(argv: list[str] | None = None) -> int:
                 return cmd_summary(cfg, engine)
             if args.command == "watch":
                 return cmd_watch(cfg, engine)
+            if args.command == "clean":
+                return cmd_clean(cfg, args)
         finally:
             db.close()
     except ConfigError as e:

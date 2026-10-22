@@ -15,10 +15,12 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import date, datetime
 
 from .config import AppConfig
 from .engine import Engine
 from .idle_worker import IdleWatcher
+from .retention import run_retention
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,7 @@ class WatchScheduler:
         self.interval = max(30, cfg.scan_interval_seconds)
         self._wake = threading.Event()          # 任一 watcher 收到 EXISTS
         self._watchers: dict[str, IdleWatcher] = {}
+        self._retention_done: dict[str, str] = {}   # 账号 → 已清理的日期（每日一次）
 
     def run(self) -> None:
         self._start_watchers()
@@ -95,10 +98,35 @@ class WatchScheduler:
                 watcher.request_resync()
 
     def _summary_check(self) -> None:
-        """非扫描周期内：检查是否到达各账号的汇总时间，到点则生成并发送。"""
+        """非扫描周期内：检查是否到达各账号的汇总时间，到点则生成并发送；
+        汇总时刻过后顺带做每日一次的保留期清理。"""
+        today = date.today().isoformat()
         for account in self.cfg.accounts:
             try:
                 if self.engine.generate_summary(account, force=False):
                     self.engine.send_outbox(account)
             except Exception:
                 logger.exception("账号 %s 每日汇总异常", account.name)
+            self._retention_check(account, today)
+
+    def _retention_check(self, account, today: str) -> None:
+        """每日保留期清理：各账号 daily_summary_time 之后跑一次。"""
+        if account.retention_days <= 0:
+            return
+        if self._retention_done.get(account.name) == today:
+            return
+        try:
+            hour, minute = (int(x) for x in account.daily_summary_time.split(":"))
+        except ValueError:
+            return   # 配置校验已挡，这里兜底
+        now = datetime.now().time()
+        if now < now.replace(hour=hour, minute=minute):
+            return   # 还没到该账号的每日维护时刻
+        try:
+            stats = run_retention(account)
+            if stats:
+                logger.info("账号 %s 每日保留期清理完成：%s", account.name, stats)
+        except Exception:
+            logger.exception("账号 %s 保留期清理异常", account.name)
+        finally:
+            self._retention_done[account.name] = today
