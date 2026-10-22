@@ -125,9 +125,10 @@ accounts:
   #   default_command: help          # 白名单来信但没带 #命令 时：help | compose
   #   max_command_attempts: 3        # 需要大模型的命令连续失败 N 次后回错误说明并终结
   #   reply_language: 简体中文        # 生成/总结/改写的输出语言偏好，留空跟随指令与素材
-  #   send_as: persona@example.com   # 可选：确认后以此配置内另一账号名义发送（两步确认码）
-  #   on_processed: move
-  #   processed_folder: Done
+    #   send_as: persona@example.com   # 可选：确认后以此配置内另一账号名义发送（两步确认码）
+    #   idle: true                     # watch 模式 IMAP IDLE 推送（默认 agent 开启；命令秒级响应）
+    #   on_processed: move
+    #   processed_folder: Done
 """
 
 
@@ -238,6 +239,7 @@ class AccountConfig:
     reply_language: str = ""              # 生成/总结/改写的输出语言偏好，空 = 跟随指令与素材
     send_as: str = ""                     # agent 专属：确认后以此账号名义发送（必须是配置里另一账号）
     sent_folder: str = "发件箱"            # 发送成功后 APPEND 已发送副本的目标文件夹（空 = 不存副本）
+    idle: bool = False                    # watch 模式 IMAP IDLE 推送监听（默认仅 agent 开启）
 
     @property
     def self_addresses(self) -> set[str]:
@@ -323,6 +325,9 @@ def _parse_account(raw: dict, index: int) -> AccountConfig:
         send_as=normalize_address(_get_str(raw, "send_as", "")),
         sent_folder=_get_str(raw, "sent_folder", "发件箱"),
     )
+    # idle 默认跟随角色（agent 要即时响应命令，monitor 靠定时汇总）；
+    # 放在 dataclass 构造后是因为默认值依赖 role 字段
+    cfg.idle = _get_bool(raw, "idle", cfg.role == "agent")
     if cfg.role not in ACCOUNT_ROLES:
         raise ConfigError(f"accounts[{index}].role 只能是 {' 或 '.join(ACCOUNT_ROLES)}，得到: {cfg.role!r}")
     required = ["name", "imap_host", "imap_user"]

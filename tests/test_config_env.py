@@ -58,6 +58,19 @@ class TestAgentAccountConfig(unittest.TestCase):
         raw = dict(_AGENT_BASE, allowed_senders="a@x.y, B@X.Y")
         self.assertEqual(cfgmod._parse_account(raw, 0).allowed_senders, ["a@x.y", "b@x.y"])
 
+    def test_idle_defaults_follow_role_and_can_be_overridden(self) -> None:
+        # agent 默认开 IDLE（命令秒级响应），monitor 默认关（靠定时汇总）
+        self.assertTrue(cfgmod._parse_account(dict(_AGENT_BASE), 0).idle)
+        monitor = cfgmod._parse_account({"name": "m", "imap_host": "h",
+                                         "imap_user": "m@example.com",
+                                         "notification_to": "n@example.com"}, 0)
+        self.assertFalse(monitor.idle)
+        # 显式配置覆盖默认（字符串形式也接受）
+        self.assertFalse(cfgmod._parse_account(dict(_AGENT_BASE, idle="false"), 0).idle)
+        raw_monitor = {"name": "m2", "imap_host": "h", "imap_user": "m2@example.com",
+                       "notification_to": "n@example.com", "idle": True}
+        self.assertTrue(cfgmod._parse_account(raw_monitor, 0).idle)
+
     def test_agent_requires_whitelist(self) -> None:
         with self.assertRaises(ConfigError):
             cfgmod._parse_account(dict(_AGENT_BASE, allowed_senders=[]), 0)
